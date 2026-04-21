@@ -8,28 +8,29 @@ and relays each command to the local Houdini plugin on port 9876.
 """
 import sys
 import os
-import site
-from pathlib import Path
 
-# Get the directory where the script is located
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
-# Add the virtual environment's site-packages to Python's path
-venv_site_packages = os.path.join(script_dir, '.venv', 'Lib', 'site-packages')
-if os.path.exists(venv_site_packages):
-    sys.path.insert(0, venv_site_packages)
-    print(f"Added {venv_site_packages} to sys.path", file=sys.stderr)
-else:
-    print(f"Warning: Virtual environment site-packages not found at {venv_site_packages}", file=sys.stderr)
-
-
-# For debugging
-print("Python path:", sys.path, file=sys.stderr)
+import glob as _glob
+_venv_candidates = [
+    os.path.join(script_dir, '.venv', 'Lib', 'site-packages'),
+    *_glob.glob(os.path.join(script_dir, '.venv', 'lib', 'python*', 'site-packages')),
+]
+for venv_site_packages in _venv_candidates:
+    if os.path.exists(venv_site_packages):
+        sys.path.insert(0, venv_site_packages)
+        break
 import json
 import socket
+import subprocess
 import logging
+import tempfile
+import shutil
+import platform
+import atexit
+import time as _time
 from dataclasses import dataclass
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
 base_dir = Path(__file__).resolve().parent
 site_packages = base_dir / ".venv" / "Lib" / "site-packages"
@@ -46,377 +47,11 @@ print("Python path:", sys.path)
 from mcp.server.fastmcp import FastMCP, Context
 import asyncio
 
-# --- OPUS Imports and Setup ---
-import requests
-from dotenv import load_dotenv
-from urllib.parse import urljoin # To construct RapidAPI URLs
-try:
-    from langchain.output_parsers import ResponseSchema, StructuredOutputParser
-    LANGCHAIN_AVAILABLE = True
-except ImportError:
-    LANGCHAIN_AVAILABLE = False
-    print("Warning: Langchain not found. opus_get_model_params_schema tool will be limited.", file=sys.stderr)
-
-# Load environment variables from urls.env located in the script's directory
-dotenv_path = os.path.join(script_dir, 'urls.env')
-if os.path.exists(dotenv_path):
-    load_dotenv(dotenv_path=dotenv_path)
-    print(f"Loaded environment variables from {dotenv_path}", file=sys.stderr)
-else:
-    print(f"Warning: urls.env not found at {dotenv_path}", file=sys.stderr)
-
-# --- Use RapidAPI variables --- 
-RAPIDAPI_HOST_URL = os.getenv("RAPIDAPI_HOST_URL") # e.g., https://opus5.p.rapidapi.com/
-RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST") # e.g., opus5.p.rapidapi.com
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
-
-# Set paths for OPUS API endpoints relative to the RapidAPI host URL
-GET_ATTRIBUTES_PATH = "/get_attributes_with_name" 
-CREATE_BATCH_PATH = "/create_opus_batch_component" # Use batch endpoint
-CREATE_COMPONENT_PATH = "/create_opus_component" # Keep old path if needed elsewhere, or remove
-VARIATE_PATH = "/variate_opus_result"
-GET_JOB_RESULT_PATH = "/get_opus_job_result"
-
-TIMEOUT = 15 # seconds
-
-if not RAPIDAPI_HOST_URL or not RAPIDAPI_HOST or not RAPIDAPI_KEY:
-    print("Error: RAPIDAPI_HOST_URL, RAPIDAPI_HOST, and RAPIDAPI_KEY environment variables must be set in urls.env", file=sys.stderr)
-else:
-    # Construct full URLs
-    GET_ATTRIBUTES_URL = urljoin(RAPIDAPI_HOST_URL, GET_ATTRIBUTES_PATH)
-#    CREATE_BATCH_URL = urljoin(RAPIDAPI_HOST_URL, CREATE_BATCH_PATH)
-    CREATE_COMPONENT_URL = urljoin(RAPIDAPI_HOST_URL, CREATE_COMPONENT_PATH)
-    VARIATE_URL = urljoin(RAPIDAPI_HOST_URL, VARIATE_PATH)
-    GET_JOB_RESULT_URL = urljoin(RAPIDAPI_HOST_URL, GET_JOB_RESULT_PATH)
-    # Optionally warn if old OPUS_API is still set
-
-# --- End OPUS Setup ---
-
+HOUDINI_PORT = int(os.getenv("HOUDINIMCP_PORT", 9876))
+HEADLESS_DISABLED = os.getenv("HOUDINIMCP_NO_HEADLESS", "").strip() in ("1", "true", "yes")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("HoudiniMCP_StdioServer")
-
-# --- Minimal api.utils.fix_rgb replication ---
-# Assume it takes a list/tuple and returns [r, g, b] if valid, else None
-def fix_rgb(color_val):
-    if isinstance(color_val, (list, tuple)) and len(color_val) == 3:
-        try:
-            # Ensure they are numbers (int or float) and within typical 0-255 or 0-1 range
-            # For simplicity, just check if they are numbers. API might expect 0-255 ints.
-            rgb = [float(c) for c in color_val]
-            # Basic check - could add range validation 0-255 or 0-1 if needed
-            return rgb # Returning as floats for now
-        except (ValueError, TypeError):
-            return None
-    return None
-# --- End utils replication ---
-
-
-# --- OPUS Helper Functions (Updated for RapidAPI) ---
-def get_all_component_names() -> List[str]:
-    # result = ["Sofa", "Chair", "Table", "CoffeeTable"] # Original subset
-    result = [
-        "Sofa", "Chair", "Table", "CoffeeTable",
-         "Library", "StreetBench", "StreetLamp", "MailboxStandalone",
-         "AntennaStandalone", "ParkingMeterStandalone", "AirConditionerStandalone",
-         "BasketballHoop", "BusStop", "FloorLamp", "Bed", "TvUnit",
-         "Sewer", "GarageDoorStandalone",
-    ] # User provided list
-    return result
-
-def get_struct_params(struct: str) -> tuple[bool, dict]:
-    if not RAPIDAPI_HOST_URL: return False, {"error": "RAPIDAPI_HOST_URL not configured"}
-    url = GET_ATTRIBUTES_URL
-    payload = {} # GET request, params in URL
-    params = { "name": struct }
-    headers = {
-        'x-rapidapi-host': RAPIDAPI_HOST,
-        'x-rapidapi-key': RAPIDAPI_KEY
-    }
-    try:
-        response = requests.request("GET", url, headers=headers, params=params, data=payload, timeout=TIMEOUT)
-        if str(response.status_code).startswith("2"):
-            r = response.json()
-            struct_result = r.get(struct) # Check if response structure changed
-            if struct_result:
-                return True, struct_result
-            elif isinstance(r, dict) and not struct_result: # Maybe the top-level key is gone?
-                 if struct in r.get("result", {}): # Check common patterns
-                     return True, r["result"]
-                 else:
-                     # Fallback: return the whole response if structure unclear but success
-                     logger.warning(f"Structure '{struct}' key not found directly in RapidAPI response, returning full JSON: {r}")
-                     return True, r 
-            else:
-                return False, {"error": f"Structure '{struct}' not found in RapidAPI response: {r}"}
-        else:
-            return False, {"error": f"RapidAPI Error {response.status_code}: {response.text}"}
-    except requests.exceptions.RequestException as e:
-        return False, {"error": f"RapidAPI request failed: {str(e)}"}
-
-def format_params(opus_response: dict) -> dict:
-    formatted = {}
-    # Adjust based on actual RapidAPI response structure if needed
-    # Assuming original structure: { "StructureName": { "assets": [...] } }
-    # Or maybe it's now just { "assets": [...] } or similar?
-    # This needs verification against actual RapidAPI output.
-    
-    # Attempt 1: Original structure
-    for asset_key, asset_data in opus_response.items():
-        if isinstance(asset_data, dict) and "assets" in asset_data:
-             for element in asset_data.get("assets", []):
-                name = element.get("name")
-                params = element.get("parameters", [])
-                if not name: continue
-                for p in params:
-                    pname = p.get("name")
-                    prange = p.get("range")
-                    ptype = p.get("type")
-                    if pname and prange is not None and ptype is not None:
-                         formatted[f"{name}/{pname}"] = (prange, ptype)
-    
-    # Attempt 2: If assets are directly under top level (heuristic)
-    if not formatted and "assets" in opus_response and isinstance(opus_response["assets"], list):
-        logger.warning("format_params: Using fallback structure parsing (assets at top level).")
-        for element in opus_response.get("assets", []):
-            name = element.get("name")
-            params = element.get("parameters", [])
-            if not name: continue
-            for p in params:
-                pname = p.get("name")
-                prange = p.get("range")
-                ptype = p.get("type")
-                if pname and prange is not None and ptype is not None:
-                        formatted[f"{name}/{pname}"] = (prange, ptype)
-                        
-    # Attempt 3: If params are directly under top level (another heuristic)
-    elif not formatted and "parameters" in opus_response and isinstance(opus_response["parameters"], list):
-        logger.warning("format_params: Using fallback structure parsing (parameters at top level).")
-        # How to get the asset name here? Assume it's part of the param name?
-        # This path is less likely or needs more info.
-        pass # Add logic if this structure is encountered
-
-    if not formatted:
-         logger.warning(f"format_params: Could not extract parameters from response: {opus_response}")
-         
-    return formatted
-
-def get_color_params(component_name: str, opus_asset_keys: List[str]) -> dict:
-    result = {}
-    # Component level color
-    result.setdefault(
-        f"{component_name}/color_rgb",
-        (
-            "List[float]", # Assuming List[float] based on fix_rgb output
-            f"Valid RGB color [R, G, B] (values likely 0-1 or 0-255, check API docs). Use if the user sets the entire color of the {component_name} or provided a single color without specifying a part."
-        ),
-    )
-    # Asset level colors
-    for asset in opus_asset_keys:
-        result.setdefault(
-            f"{asset}/color_rgb",
-            (
-                "List[float]", # Assuming List[float]
-                f"Valid RGB color [R, G, B] for the {asset} part. Use if user set the color of this specific part of the {component_name}."
-            ),
-        )
-    return result
-
-def get_param_json(param_json: dict, color_params: dict) -> str:
-    if not LANGCHAIN_AVAILABLE:
-        # Fallback: simple JSON representation if Langchain is missing
-        combined = {}
-        for key, value in param_json.items():
-            combined[key] = {"range": value[0], "type": value[1], "description": f"Allowed range: {value[0]}"}
-        for key, value in color_params.items():
-            combined[key] = {"type": value[0], "description": value[1]}
-        return json.dumps(combined, indent=2)
-
-    # Langchain way
-    response_schemas = []
-    for key, value in param_json.items():
-        response_schemas.append(
-            ResponseSchema(name=key, description=f"Allowed range: {value[0]}", type=str(value[1])) # Ensure type is string
-        )
-    for key, value in color_params.items():
-        response_schemas.append(
-            ResponseSchema(name=key, description=str(value[1]), type=str(value[0])) # Ensure type is string
-        )
-    try:
-        output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
-        prompt_var = output_parser.get_format_instructions(only_json=True)
-        return prompt_var
-    except Exception as e:
-        logger.error(f"Langchain StructuredOutputParser failed: {e}")
-        # Fallback if Langchain parsing fails
-        combined = {key: {"range": value[0], "type": value[1]} for key, value in param_json.items()}
-        combined.update({key: {"type": value[0], "description": value[1]} for key, value in color_params.items()})
-        return json.dumps(combined, indent=2)
-
-
-def get_formatted_opus_params(structure: str) -> dict:
-    # this is the main function to be called, copy of lambda function
-    f, structure_json = get_struct_params(structure)
-    if f:
-        formatted_params = format_params(structure_json)
-        # Extract keys carefully, might need adjustment based on format_params heuristics
-        asset_keys = list(structure_json.keys()) if isinstance(structure_json, dict) else [] 
-        if not asset_keys and "assets" in structure_json and isinstance(structure_json["assets"], list):
-             asset_keys = [a.get("name") for a in structure_json["assets"] if a.get("name")]
-             
-        color_params = get_color_params(structure, asset_keys) 
-        schema_str = get_param_json(formatted_params, color_params)
-        # Try to parse back to JSON for consistent return type
-        try:
-            schema_json = json.loads(schema_str)
-            return {"statusCode": 200, "result": schema_json}
-        except json.JSONDecodeError:
-             # If get_param_json returned non-JSON string (e.g. Langchain format instructions)
-             return {"statusCode": 200, "result_format_instructions": schema_str}
-    else:
-        # structure_json should contain the error from get_struct_params
-        status_code = 500 # Default error code
-        if isinstance(structure_json, dict) and "error" in structure_json:
-             if "RapidAPI Error 4" in structure_json["error"]: #粗略检查 4xx 错误
-                  status_code = 400 # Or map specific codes if needed
-             elif "RapidAPI Error 5" in structure_json["error"]:
-                  status_code = 503 # Service unavailable or internal error
-                  
-        return {"statusCode": status_code, "error": structure_json.get("error", "Unknown error retrieving parameters")} 
-
-def check_rgbs(structure: str, params: dict) -> dict:
-    clean_params = {}
-    if not isinstance(params, dict): return {} # Guard against non-dict input
-    for k, v in params.items():
-        if "color_rgb" in k:
-            # Handle simplified key case from get_color_params
-            if k == f"{structure}/color_rgb":
-                valid_rgb = fix_rgb(v)
-                if valid_rgb is not None:
-                    clean_params[k] = valid_rgb # Use the potentially simplified key
-            elif "/" in k: # Assume format like "asset/color_rgb"
-                 valid_rgb = fix_rgb(v)
-                 if valid_rgb is not None:
-                    clean_params[k] = valid_rgb
-            # Optional: Add handling for _layout/color_rgb if needed? User code had it commented.
-            # elif "_layout/color_rgb" in k:
-            #     k_fixed = f"{structure}/color_rgb" # Map it?
-            #     valid_rgb = fix_rgb(v)
-            #     if valid_rgb is not None:
-            #         clean_params[k_fixed] = valid_rgb
-        else:
-            clean_params[k] = v
-    return clean_params
-
-def create_opus_batch(component_type: str, params: dict, count: int = 1) -> tuple[bool, dict]:
-    if not RAPIDAPI_HOST_URL: return False, {"error": "RAPIDAPI_HOST_URL not configured"}
-    url = CREATE_COMPONENT_URL # Use the correct RapidAPI URL
-    p = {
-        "name": component_type,
-        "parameters": params,
-        "extensions": ["gltf"], # Hardcoded GLTF for now
-    #    "count": count, # Add count parameter
-        # Add texture_resolution? Required by user example?
-        # "texture_resolution": "1024", # Assuming default, adjust if needed
-    }
-    payload = json.dumps(p)
-    headers = {
-        'Content-Type': 'application/json',
-        'x-rapidapi-host': RAPIDAPI_HOST,
-        'x-rapidapi-key': RAPIDAPI_KEY
-    }
-    try:
-        response = requests.request("POST", url, headers=headers, data=payload, timeout=TIMEOUT)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        r = response.json()
-        # Check response structure for batch_id (might be different from old API)
-        batch_id = r.get("batch_job_id") or r.get("batch_id") or r.get("job_id") # Check common keys
-        if batch_id:
-            return True, r # Return the full response which contains the ID
-        else:
-             logger.error(f"RapidAPI batch creation success but no batch_id found in response: {r}")
-             return False, {"error": "API succeeded but batch_id missing in response."}
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"RapidAPI Error {e.response.status_code} creating batch: {e.response.text}")
-        try:
-             # Try to return the JSON error body if possible
-             error_json = e.response.json()
-             error_json["status_code"] = e.response.status_code # Add status code for later use
-             return False, error_json
-        except json.JSONDecodeError:
-             return False, {"error": f"RapidAPI Error {e.response.status_code}: {e.response.text}", "status_code": e.response.status_code}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"RapidAPI request failed creating batch: {str(e)}")
-        return False, {"error": f"RapidAPI request failed: {str(e)}"}
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode RapidAPI response: {str(e)}")
-        return False, {"error": "Failed to decode RapidAPI response."}
-
-
-def create_opus_component(structure: str, params: dict, count: int = 1) -> dict:
-    # Ensure params is a dict
-    if not isinstance(params, dict):
-         return {"statusCode": 400, "error": "Parameters must be a valid JSON object (dict)."}
-         
-    clean_params = check_rgbs(structure, params)
-    status, result_json = create_opus_batch(structure, clean_params, count)
-    if status:
-        # Extract batch ID (key might vary)
-        batch_id = result_json.get("batch_job_id") or result_json.get("batch_id") or result_json.get("job_id")
-        if batch_id:
-             logger.info(f"OPUS (RapidAPI) batch job created: {batch_id}")
-             # Return a consistent success structure
-             return {"statusCode": 200, "batch_id": batch_id, "raw_response": result_json}
-        else:
-             # This case should be handled inside create_opus_batch now
-             logger.error(f"API success but no batch_job_id found in response: {result_json}")
-             return {"statusCode": 500, "error": "API succeeded but batch_id missing."}
-    else:
-        # result_json already contains the error from create_opus_batch
-        return {"statusCode": result_json.pop("status_code", 500), **result_json} # Use status_code if available
-
-
-def variate_opus_result(result_id: str, count: int = 12) -> dict:
-    if not RAPIDAPI_HOST_URL: return {"statusCode": 500, "error": "RAPIDAPI_HOST_URL not configured"}
-    url = VARIATE_URL # Use RapidAPI URL
-    p = {
-         "base_job_uid": result_id, # Parameter name might change, check RapidAPI docs
-         "count": count
-         # Any other params needed for variation?
-    }
-    payload = json.dumps(p)
-    headers = {
-        'Content-Type': 'application/json',
-        'x-rapidapi-host': RAPIDAPI_HOST,
-        'x-rapidapi-key': RAPIDAPI_KEY
-    }
-    try:
-        response = requests.request("POST", url, headers=headers, data=payload, timeout=TIMEOUT)
-        response.raise_for_status()
-        result_json = response.json()
-        # Extract batch_id (key might vary)
-        batch_id = result_json.get("batch_job_id") or result_json.get("batch_id") or result_json.get("job_id")
-        if batch_id:
-            logger.info(f"OPUS (RapidAPI) variation batch job created: {batch_id}")
-            return {"statusCode": 200, "batch_id": batch_id, "raw_response": result_json}
-        else:
-            logger.error(f"RapidAPI variation success but no batch_id found: {result_json}")
-            return {"statusCode": 500, "error": "API variation succeeded but batch_id missing."}
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"RapidAPI Error {e.response.status_code} creating variation: {e.response.text}")
-        try:
-             error_json = e.response.json()
-             return {"statusCode": e.response.status_code, "error": error_json}
-        except json.JSONDecodeError:
-             return {"statusCode": e.response.status_code, "error": e.response.text}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"RapidAPI request failed creating variation: {str(e)}")
-        return {"statusCode": 500, "error": f"Request failed: {str(e)}"}
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode variation RapidAPI response: {str(e)}")
-        return {"statusCode": 500, "error": "Failed to decode variation RapidAPI response."}
-
-# --- End OPUS Helper Functions ---
 
 
 @dataclass
@@ -424,6 +59,9 @@ class HoudiniConnection:
     host: str
     port: int
     sock: socket.socket = None
+    connected_since: float = None
+    last_command_at: float = None
+    command_count: int = 0
 
     def connect(self) -> bool:
         """Connect to the Houdini plugin (which is listening on self.host:self.port)."""
@@ -432,11 +70,13 @@ class HoudiniConnection:
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
+            self.connected_since = asyncio.get_event_loop().time()
             logger.info(f"Connected to Houdini at {self.host}:{self.port}")
             return True
         except Exception as e:
             logger.error(f"Failed to connect to Houdini: {str(e)}")
             self.sock = None
+            self.connected_since = None
             return False
 
     def disconnect(self):
@@ -447,6 +87,18 @@ class HoudiniConnection:
             except Exception as e:
                 logger.error(f"Error disconnecting from Houdini: {str(e)}")
             self.sock = None
+            self.connected_since = None
+
+    def get_status(self) -> dict:
+        """Return current connection status info."""
+        return {
+            "connected": self.sock is not None,
+            "host": self.host,
+            "port": self.port,
+            "connected_since": self.connected_since,
+            "last_command_at": self.last_command_at,
+            "command_count": self.command_count,
+        }
 
     def send_command(self, cmd_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """
@@ -454,62 +106,51 @@ class HoudiniConnection:
         Returns the parsed Python dict (e.g. {"status": "success", "result": {...}})
         """
         if not self.connect():
-            # Instead of raising, return an error dict consistent with API errors
-            error_msg = "Could not connect to Houdini on port 9876."
+            error_msg = f"Could not connect to Houdini on port {self.port}."
             logger.error(error_msg)
-            # Return structure similar to API failures
             return {"status": "error", "message": error_msg, "origin": "mcp_server_connection"}
-            # raise ConnectionError("Could not connect to Houdini on port 9876.") # Original way
 
         command = {"type": cmd_type, "params": params or {}}
         data_out = json.dumps(command).encode("utf-8")
 
+        timeout = 30.0
+        recv_size = 8192
+
         try:
             # Send the command
             self.sock.sendall(data_out)
+            self.last_command_at = asyncio.get_event_loop().time()
+            self.command_count += 1
             logger.info(f"Sent command to Houdini: {command}")
 
             # Read response. We'll accumulate chunks until we can parse a full JSON.
-            chunks = []
-            self.sock.settimeout(10.0) # Use TIMEOUT? Or keep specific timeout for Houdini comms?
+            self.sock.settimeout(timeout)
             buffer = b""
             start_time = asyncio.get_event_loop().time()
             while True:
-                 # Check for timeout
-                if asyncio.get_event_loop().time() - start_time > 10.0: # Use same timeout value
+                if asyncio.get_event_loop().time() - start_time > timeout:
                      raise socket.timeout("Timeout waiting for Houdini response")
-                     
-                # Non-blocking read if possible, or use select/poll?
-                # Sticking with blocking recv with timeout for now
-                chunk = self.sock.recv(8192)
+
+                chunk = self.sock.recv(recv_size)
                 if not chunk:
-                    # Connection closed gracefully by Houdini?
-                    if buffer: # If we have partial data, it's an error
+                    if buffer:
                          raise ConnectionAbortedError("Connection closed by Houdini with incomplete data.")
-                    else: # No data received and socket closed -> Houdini might have crashed?
+                    else:
                          raise ConnectionAbortedError("Connection closed by Houdini before sending data.")
-                         
+
                 buffer += chunk
-                # Try to decode the accumulated buffer
                 try:
                     decoded_string = buffer.decode("utf-8")
-                    # Attempt to load JSON from the decoded string
                     parsed = json.loads(decoded_string)
-                    # If successful, we have a complete JSON object
                     logger.info(f"Received response from Houdini: {parsed}")
                     return parsed
                 except json.JSONDecodeError:
-                    # Not a complete JSON object yet, continue receiving
                     continue
                 except UnicodeDecodeError:
-                    # Data received is not valid UTF-8
                      logger.error("Received non-UTF-8 data from Houdini")
                      raise ValueError("Received non-UTF-8 data from Houdini")
 
-            # Should not be reached if loop exits via return or exception
-            # raise Exception("No (or incomplete) data from Houdini; EOF reached without valid JSON.")
-
-        except socket.timeout: # Explicitly catch socket timeout
+        except socket.timeout:
             error_msg = "Timeout receiving data from Houdini."
             logger.error(error_msg)
             self.disconnect()
@@ -517,150 +158,316 @@ class HoudiniConnection:
         except Exception as e:
             error_msg = f"Error during Houdini communication for command '{cmd_type}': {str(e)}"
             logger.error(error_msg)
-            # Invalidate socket so we reconnect next time
             self.disconnect()
-            # Return error dict consistent with API failures
             return {"status": "error", "message": error_msg, "origin": "mcp_server_send_command"}
-            # raise # Re-raise original exception? Or return dict? Returning dict.
 
 
-# A global Houdini connection object
+# ---- Headless hython management ----
+
+_hython_process = None
+
+
+def find_hython() -> Optional[str]:
+    """Locate the hython binary (Houdini's headless Python interpreter)."""
+    # 1. HFS env var (set when Houdini environment is sourced)
+    hfs = os.environ.get("HFS")
+    if hfs:
+        candidate = os.path.join(hfs, "bin", "hython")
+        if os.path.isfile(candidate):
+            return candidate
+
+    # 2. Already on PATH
+    on_path = shutil.which("hython")
+    if on_path:
+        return on_path
+
+    # 3. Scan common install locations
+    system = platform.system()
+    candidates = []
+    if system == "Linux":
+        if os.path.isdir("/opt"):
+            for d in sorted(os.listdir("/opt"), reverse=True):
+                if d.startswith("hfs"):
+                    candidates.append(os.path.join("/opt", d, "bin", "hython"))
+    elif system == "Windows":
+        for base in [r"C:\Program Files\Side Effects Software",
+                     r"C:\Program Files (x86)\Side Effects Software"]:
+            if os.path.isdir(base):
+                for d in sorted(os.listdir(base), reverse=True):
+                    candidates.append(os.path.join(base, d, "bin", "hython.exe"))
+    elif system == "Darwin":
+        for base in ["/Applications/Houdini"]:
+            if os.path.isdir(base):
+                for d in sorted(os.listdir(base), reverse=True):
+                    candidates.append(os.path.join(
+                        base, d, "Frameworks", "Houdini.framework",
+                        "Versions", "Current", "Resources", "bin", "hython"))
+        if os.path.isdir("/opt"):
+            for d in sorted(os.listdir("/opt"), reverse=True):
+                if d.startswith("hfs"):
+                    candidates.append(os.path.join("/opt", d, "bin", "hython"))
+
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _port_is_listening(port: int, host: str = "localhost") -> bool:
+    """Check if a TCP port is accepting connections."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            s.connect((host, port))
+        return True
+    except (ConnectionRefusedError, OSError, socket.timeout):
+        return False
+
+
+def _launch_headless_houdini() -> bool:
+    """Launch hython with the headless MCP server. Returns True if server is ready."""
+    global _hython_process
+    if _hython_process and _hython_process.poll() is None:
+        return _port_is_listening(HOUDINI_PORT)
+
+    hython = find_hython()
+    if not hython:
+        logger.warning("Cannot launch headless Houdini: hython not found.")
+        return False
+
+    headless_script = os.path.join(script_dir, "scripts", "headless_server.py")
+    if not os.path.isfile(headless_script):
+        logger.error(f"Headless server script not found: {headless_script}")
+        return False
+
+    env = os.environ.copy()
+    env["HOUDINIMCP_PORT"] = str(HOUDINI_PORT)
+
+    logger.info(f"Launching headless Houdini: {hython} {headless_script}")
+    _hython_process = subprocess.Popen(
+        [hython, headless_script],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # Wait for the server to start listening (up to 30 seconds — hython startup is slow)
+    for _ in range(60):
+        if _hython_process.poll() is not None:
+            # Process exited unexpectedly
+            stderr = _hython_process.stderr.read().decode(errors="replace")
+            logger.error(f"hython exited early (code {_hython_process.returncode}): {stderr[:500]}")
+            _hython_process = None
+            return False
+        if _port_is_listening(HOUDINI_PORT):
+            logger.info("Headless Houdini is ready.")
+            return True
+        _time.sleep(0.5)
+
+    logger.error("Headless Houdini failed to start within 30 seconds.")
+    _cleanup_hython()
+    return False
+
+
+def _cleanup_hython():
+    """Terminate the managed hython process if running."""
+    global _hython_process
+    if _hython_process and _hython_process.poll() is None:
+        logger.info("Shutting down headless Houdini...")
+        _hython_process.terminate()
+        try:
+            _hython_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _hython_process.kill()
+            _hython_process.wait()
+    _hython_process = None
+
+
+atexit.register(_cleanup_hython)
+
+
+# ---- Global connection ----
+
 _houdini_connection: HoudiniConnection = None
 
+
 def get_houdini_connection() -> HoudiniConnection:
-    """Get or create a persistent HoudiniConnection object."""
+    """Get or create a persistent HoudiniConnection object.
+
+    If no Houdini instance is listening, attempts to launch a headless hython
+    session automatically (unless HOUDINIMCP_NO_HEADLESS=1 is set).
+    """
     global _houdini_connection
     if _houdini_connection is None:
         logger.info("Creating new HoudiniConnection.")
-        _houdini_connection = HoudiniConnection(host="localhost", port=9876)
+        _houdini_connection = HoudiniConnection(host="localhost", port=HOUDINI_PORT)
 
-    # Always try to connect, returns True if already connected or successful now
     if not _houdini_connection.connect():
-         # Connection failed, reset _houdini_connection to allow retry next time?
-         _houdini_connection = None
-         raise ConnectionError("Could not connect to Houdini on localhost:9876. Is the plugin running?")
-         
+        # No Houdini listening — try launching headless
+        if not HEADLESS_DISABLED:
+            logger.info("No Houdini detected. Attempting headless launch...")
+            if _launch_headless_houdini():
+                # Retry connection
+                _houdini_connection = HoudiniConnection(host="localhost", port=HOUDINI_PORT)
+                if _houdini_connection.connect():
+                    return _houdini_connection
+
+        _houdini_connection = None
+        raise ConnectionError(
+            f"Could not connect to Houdini on localhost:{HOUDINI_PORT}. "
+            "Is the plugin running? (Set HOUDINIMCP_NO_HEADLESS=1 to disable auto-launch.)"
+        )
+
     return _houdini_connection
 
 
 # Now define the MCP server that Claude will talk to over stdio
-mcp = FastMCP("HoudiniMCP")
+mcp = FastMCP("HoudiniMCP", instructions="""\
+IMPORTANT — Houdini MCP Connection Rules:
+
+1. **Never rapid-fire commands.** Wait at least 1 second between consecutive tool calls.
+   The Houdini plugin uses a single-threaded listener and needs time to reset between connections.
+
+2. **Separate scene commands from render commands.** Do all scene setup (create nodes,
+   modify parameters, set materials, connect nodes, etc.) FIRST. Then call render tools
+   in a separate step.
+
+3. **Render commands are slow.** Rendering takes significantly longer than node operations.
+   Do not assume a render has failed just because it takes time.
+
+4. **If you get a connection error, STOP.** Do not retry in a loop — you likely crashed
+   the plugin. Tell the user to restart the Houdini MCP plugin and verify the port is
+   listening before trying again.
+
+5. **Verify connectivity first.** Use the `ping` tool before starting work to confirm
+   the Houdini plugin is reachable. If ping fails, tell the user immediately.
+
+6. **Render workflow:** Render tools save images to disk (in /tmp/ by default) and return
+   the file path. Use the Read tool to view the rendered image directly, or tell the user
+   the file path.
+
+7. **Use batch for bulk operations.** When creating multiple nodes or making many
+   changes at once, prefer the `batch` tool over individual calls. This executes
+   atomically in a single undo group and avoids rapid-fire connection issues.
+
+8. **Monitor long renders.** After launching a Karma or Mantra render, use
+   `monitor_render` to poll for `husk` / `mantra-bin` processes and check if
+   the output file exists. No Houdini connection needed.
+
+9. **Document non-trivial discoveries.** If you encounter a silent failure,
+   undocumented API quirk, or required workaround while using this MCP, read
+   `BEST_PRACTICES.md` in the houdini-mcp repo root first to check it isn't
+   already covered, then add a brief entry under the appropriate context
+   section (COPs, SOPs, LOPs, etc.) and update the index. Keep entries short:
+   problem, symptom, fix. No essays.
+""")
 
 @asynccontextmanager
 async def server_lifespan(app: FastMCP):
     """Startup/shutdown logic. Called automatically by fastmcp."""
     logger.info("Houdini MCP server starting up (stdio).")
-    # Attempt to connect right away? Or lazily on first call? Lazy seems safer.
-    # try:
-    #     get_houdini_connection()
-    #     logger.info("Successfully connected to Houdini on startup.")
-    # except Exception as e:
-    #     logger.warning(f"Could not connect to Houdini on startup: {e}")
-    #     logger.warning("Make sure Houdini is running with the plugin on port 9876.")
-    yield {} # Context is empty for now
+    yield {}
     logger.info("Houdini MCP server shutting down.")
     global _houdini_connection
     if _houdini_connection is not None:
         _houdini_connection.disconnect()
         _houdini_connection = None
+    _cleanup_hython()
     logger.info("Connection to Houdini closed.")
 
 mcp.lifespan = server_lifespan
 
 
-# -------------------------------------------------------------------
-# Original Houdini Tools (Get/Create Node, Execute Code)
-# -------------------------------------------------------------------
+def _send_tool_command(cmd_type: str, params: Dict[str, Any] = None) -> str:
+    """Send a command to Houdini and return the JSON result string."""
+    conn = get_houdini_connection()
+    response = conn.send_command(cmd_type, params)
+    if response.get("status") == "error":
+        origin = response.get("origin", "houdini")
+        return f"Error ({origin}): {response.get('message', 'Unknown error')}"
+    return json.dumps(response.get("result", {}), indent=2)
+
+
+@mcp.tool()
+def ping(ctx: Context) -> str:
+    """
+    Health check to verify Houdini is connected and responsive.
+    Returns server status info or an error if Houdini is unreachable.
+    """
+    try:
+        conn = get_houdini_connection()
+        response = conn.send_command("ping")
+        if response.get("status") == "error":
+            return f"Houdini unreachable: {response.get('message', 'Unknown error')}"
+        return json.dumps(response.get("result", {}), indent=2)
+    except ConnectionError as e:
+        return f"Houdini unreachable: {str(e)}"
+    except Exception as e:
+        return f"Ping failed: {str(e)}"
+
+@mcp.tool()
+def get_connection_status(ctx: Context) -> str:
+    """
+    Returns the current connection status to Houdini, including
+    whether connected, port, command count, and timing info.
+    """
+    global _houdini_connection
+    if _houdini_connection is None:
+        return json.dumps({"connected": False, "host": "localhost", "port": HOUDINI_PORT})
+    return json.dumps(_houdini_connection.get_status(), indent=2)
+
 @mcp.tool()
 def get_scene_info(ctx: Context) -> str:
     """
     Ask Houdini for scene info. Returns JSON as a string.
     """
-    try:
-        conn = get_houdini_connection()
-        response = conn.send_command("get_scene_info")
-        # response should look like {"status": "success", "result": {...}} or {"status": "error", ...}
-        if response.get("status") == "error":
-            # Include origin if available
-            origin = response.get('origin', 'houdini')
-            return f"Error ({origin}): {response.get('message', 'Unknown error')}"
-        return json.dumps(response.get("result", {}), indent=2) # Return empty dict if no result
-    except ConnectionError as e:
-         return f"Connection Error getting scene info: {str(e)}"
-    except Exception as e:
-        # Catch-all for unexpected errors in this function
-        logger.error(f"Unexpected error in get_scene_info tool: {str(e)}", exc_info=True)
-        return f"Server Error retrieving scene info: {str(e)}"
+    return _send_tool_command("get_scene_info")
 
 @mcp.tool()
 def create_node(ctx: Context, node_type: str, parent_path: str = "/obj", name: str = None) -> str:
     """
     Create a new node in Houdini.
     """
-    try:
-        conn = get_houdini_connection()
-        params = { "node_type": node_type, "parent_path": parent_path }
-        if name: params["name"] = name
-        response = conn.send_command("create_node", params)
-
-        if response.get("status") == "error":
-            origin = response.get('origin', 'houdini')
-            return f"Error ({origin}): {response.get('message', 'Unknown error')}"
-        # Assuming result contains node info like {'name': ..., 'path': ..., 'type': ...}
-        return f"Node created: {json.dumps(response.get('result', {}), indent=2)}"
-    except ConnectionError as e:
-         return f"Connection Error creating node: {str(e)}"
-    except Exception as e:
-        logger.error(f"Unexpected error in create_node tool: {str(e)}", exc_info=True)
-        return f"Server Error creating node: {str(e)}"
+    params = {"node_type": node_type, "parent_path": parent_path}
+    if name:
+        params["name"] = name
+    return _send_tool_command("create_node", params)
 
 @mcp.tool()
-def execute_houdini_code(ctx: Context, code: str) -> str:
+def execute_houdini_code(ctx: Context, code: str, allow_dangerous: bool = False) -> str:
     """
     Execute arbitrary Python code in Houdini's environment.
     Returns status and any stdout/stderr generated by the code.
+    Blocks dangerous patterns (hou.exit, os.remove, subprocess, etc.) unless allow_dangerous=True.
     """
-    try:
-        conn = get_houdini_connection()
-        response = conn.send_command("execute_code", {"code": code})
+    conn = get_houdini_connection()
+    params = {"code": code}
+    if allow_dangerous:
+        params["allow_dangerous"] = True
+    response = conn.send_command("execute_code", params)
 
-        # Handle Houdini-side errors first (could be connection error or execution error)
-        if response.get("status") == "error":
-            origin = response.get('origin', 'houdini')
-            return f"Error ({origin}): {response.get('message', 'Unknown error')}"
+    if response.get("status") == "error":
+        origin = response.get('origin', 'houdini')
+        return f"Error ({origin}): {response.get('message', 'Unknown error')}"
 
-        # Handle success case (response should have status=success and a result dict)
-        result = response.get("result", {}) # Default to empty dict
-        if result.get("executed"): # Check if executed flag is True
-            stdout = result.get("stdout", "").strip()
-            stderr = result.get("stderr", "").strip()
+    result = response.get("result", {})
+    if result.get("executed"):
+        stdout = result.get("stdout", "").strip()
+        stderr = result.get("stderr", "").strip()
+        output_message = "Code executed successfully."
+        if stdout:
+            output_message += f"\\n--- Stdout ---\\n{stdout}"
+        if stderr:
+            output_message += f"\\n--- Stderr ---\\n{stderr}"
+        return output_message
 
-            output_message = "Code executed successfully."
-            if stdout:
-                output_message += f"\\n--- Stdout ---\\n{stdout}"
-            if stderr:
-                output_message += f"\\n--- Stderr ---\\n{stderr}"
-            return output_message
-        else:
-            # Unexpected success response format or executed flag missing/false
-            logger.warning(f"execute_houdini_code received success status but unexpected result format: {response}")
-            return f"Execution status unclear from Houdini response: {json.dumps(response)}"
+    return f"Execution status unclear from Houdini response: {json.dumps(response)}"
 
-    except ConnectionError as e:
-         return f"Connection Error executing code: {str(e)}"
-    except Exception as e:
-        # Errors during communication or parsing in this script
-        logger.error(f"Unexpected error in execute_houdini_code tool: {str(e)}", exc_info=True)
-        return f"Server Error executing code: {str(e)}"
-
-# -------------------------------------------------------------------
-# NEW rendering Tools
-# -------------------------------------------------------------------
 @mcp.tool()
 def render_single_view(ctx: Context,
                        orthographic: bool = False,
                        rotation: List[float] = [0, 90, 0],
-                       render_path: str = "C:/temp/",
+                       render_path: str = None,
                        render_engine: str = "opengl",
                        karma_engine: str = "cpu") -> str:
     """
@@ -671,7 +478,7 @@ def render_single_view(ctx: Context,
         response = conn.send_command("render_single_view", {
             "orthographic": orthographic,
             "rotation": rotation,
-            "render_path": render_path,
+            "render_path": render_path or tempfile.gettempdir(),
             "render_engine": render_engine,
             "karma_engine": karma_engine,
         })
@@ -680,14 +487,18 @@ def render_single_view(ctx: Context,
             origin = response.get("origin", "houdini")
             return f"Error ({origin}): {response.get('message', 'Unknown error')}"
 
-        return response.get("result", "Render completed but no output path returned.")
+        result = response.get("result", {})
+        if isinstance(result, dict) and result.get("filepath"):
+            res = result.get("resolution", [0, 0])
+            return f"Rendered to {result['filepath']} ({res[0]}x{res[1]}, {render_engine})"
+        return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"render_single_view failed: {e}", exc_info=True)
         return f"Render failed: {str(e)}"
 
 @mcp.tool()
 def render_quad_views(ctx: Context,
-                      render_path: str = "C:/temp/",
+                      render_path: str = None,
                       render_engine: str = "opengl",
                       karma_engine: str = "cpu") -> str:
     """
@@ -696,7 +507,7 @@ def render_quad_views(ctx: Context,
     try:
         conn = get_houdini_connection()
         response = conn.send_command("render_quad_view", {
-            "render_path": render_path,
+            "render_path": render_path or tempfile.gettempdir(),
             "render_engine": render_engine,
             "karma_engine": karma_engine,
         })
@@ -705,7 +516,16 @@ def render_quad_views(ctx: Context,
             origin = response.get("origin", "houdini")
             return f"Error ({origin}): {response.get('message', 'Unknown error')}"
 
-        return response.get("result", "Render completed but no output returned.")
+        result = response.get("result", {})
+        if isinstance(result, dict) and isinstance(result.get("results"), list):
+            lines = ["Rendered views:"]
+            for view in result["results"]:
+                name = view.get("view_name", "unknown")
+                fp = view.get("filepath", "?")
+                res = view.get("resolution", [0, 0])
+                lines.append(f"  {name}: {fp} ({res[0]}x{res[1]})")
+            return "\n".join(lines)
+        return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"render_quad_views failed: {e}", exc_info=True)
         return f"Render failed: {str(e)}"
@@ -713,7 +533,7 @@ def render_quad_views(ctx: Context,
 @mcp.tool()
 def render_specific_camera(ctx: Context,
                            camera_path: str,
-                           render_path: str = "C:/temp/",
+                           render_path: str = None,
                            render_engine: str = "opengl",
                            karma_engine: str = "cpu") -> str:
     """
@@ -723,7 +543,7 @@ def render_specific_camera(ctx: Context,
         conn = get_houdini_connection()
         response = conn.send_command("render_specific_camera", {
             "camera_path": camera_path,
-            "render_path": render_path,
+            "render_path": render_path or tempfile.gettempdir(),
             "render_engine": render_engine,
             "karma_engine": karma_engine,
         })
@@ -732,182 +552,1385 @@ def render_specific_camera(ctx: Context,
             origin = response.get("origin", "houdini")
             return f"Error ({origin}): {response.get('message', 'Unknown error')}"
 
-        return response.get("result", "Render completed but no output path returned.")
+        result = response.get("result", {})
+        if isinstance(result, dict) and result.get("filepath"):
+            res = result.get("resolution", [0, 0])
+            return f"Rendered to {result['filepath']} ({res[0]}x{res[1]}, {render_engine})"
+        return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"render_specific_camera failed: {e}", exc_info=True)
         return f"Render failed: {str(e)}"
 
-# -------------------------------------------------------------------
-# NEW OPUS API Tools
-# -------------------------------------------------------------------
 
 @mcp.tool()
-def opus_get_model_names(ctx: Context) -> List[str]:
-    """
-    Returns a list of available OPUS component/structure names.
-    """
-    # Currently uses the hardcoded list from helpers
-    return get_all_component_names()
+def modify_node(ctx: Context, path: str, parameters: Dict[str, Any] = None,
+                position: List[float] = None, name: str = None) -> str:
+    """Modify an existing node — rename, reposition, or change parameters."""
+    params = {"path": path}
+    if parameters is not None:
+        params["parameters"] = parameters
+    if position is not None:
+        params["position"] = position
+    if name is not None:
+        params["name"] = name
+    return _send_tool_command("modify_node", params)
 
 @mcp.tool()
-def opus_get_model_params_schema(ctx: Context, structure: str) -> dict:
-    """
-    Retrieves the parameter schema or format instructions for a given OPUS model structure.
-    Returns a dictionary, which might contain 'result' (JSON schema) or 'result_format_instructions' (string).
-    Check 'statusCode' for success (200) or failure (e.g., 500).
-    """
-    if not structure:
-        return {"statusCode": 400, "error": "Structure name cannot be empty."}
-    # This function now returns a dict with statusCode and result/error
-    return get_formatted_opus_params(structure)
+def delete_node(ctx: Context, path: str) -> str:
+    """Delete a node from the Houdini scene by path."""
+    return _send_tool_command("delete_node", {"path": path})
 
 @mcp.tool()
-def opus_create_model(ctx: Context, structure: str, parameters: Dict[str, Any], count: int = 1) -> dict:
-    """
-    Starts a batch job to create one or more 3D models using the OPUS API.
-    Requires the model structure name and a dictionary of parameters.
-    Returns a dictionary containing the 'batch_id' on success (statusCode 200) or an error message.
-    """
-    if not structure:
-        return {"statusCode": 400, "error": "Structure name cannot be empty."}
-    if not isinstance(parameters, dict):
-         return {"statusCode": 400, "error": "Parameters must be a valid JSON object (dict)."}
-    if not isinstance(count, int) or count < 1:
-         return {"statusCode": 400, "error": "Count must be a positive integer."}
-         
-    # This function handles API call and returns dict with statusCode and batch_id/error
-    return create_opus_component(structure, parameters, count)
+def get_node_info(ctx: Context, path: str) -> str:
+    """Get detailed info about a node: type, parameters, inputs, outputs."""
+    return _send_tool_command("get_node_info", {"path": path})
 
 @mcp.tool()
-def opus_variate_model(ctx: Context, result_id: str, count: int = 12) -> dict:
-    """
-    Starts a batch job to create variations of an existing OPUS model result.
-    Requires the result_id of the base model.
-    Returns a dictionary containing the 'batch_id' on success (statusCode 200) or an error message.
-    """
-    if not result_id:
-        return {"statusCode": 400, "error": "Result ID cannot be empty."}
-    if not isinstance(count, int) or count < 1:
-         return {"statusCode": 400, "error": "Count must be a positive integer."}
-
-    # This function handles API call and returns dict with statusCode and batch_id/error
-    return variate_opus_result(result_id, count)
-
-# -------------------------------------------------------------------
-# NEW Tools Forwarding to Houdini for OPUS Job Handling
-# -------------------------------------------------------------------
+def set_material(ctx: Context, node_path: str, material_type: str = "principledshader",
+                 name: str = None, parameters: Dict[str, Any] = None) -> str:
+    """Create or apply a material to an OBJ node."""
+    params = {"node_path": node_path, "material_type": material_type}
+    if name is not None:
+        params["name"] = name
+    if parameters is not None:
+        params["parameters"] = parameters
+    return _send_tool_command("set_material", params)
 
 @mcp.tool()
-def opus_check_job_status(ctx: Context, batch_id: str) -> dict:
-    """
-    Checks the status of an OPUS batch job directly via the API.
-    Requires the batch_id returned by opus_create_model or opus_variate_model.
-    Returns the JSON response from the OPUS API, including status and potential download URLs, or an error dictionary.
-    """
-    if not batch_id:
-        return {"error": "Batch ID cannot be empty."}
-    
-    # Call the helper function directly
-    result = get_opus_job_result(batch_job_id=batch_id)
-    return result # Return the dictionary (contains result or error)
+def connect_nodes(ctx: Context, src_path: str, dst_path: str,
+                  dst_input_index: int = 0, src_output_index: int = 0) -> str:
+    """Connect two nodes: src output -> dst input."""
+    return _send_tool_command("connect_nodes", {
+        "src_path": src_path,
+        "dst_path": dst_path,
+        "dst_input_index": dst_input_index,
+        "src_output_index": src_output_index,
+    })
 
 @mcp.tool()
-def opus_import_model_url(ctx: Context, download_url: str, node_name: str = None) -> str:
-    """
-    Asks Houdini to download a model (zip containing USD) from a URL and import it into the scene.
-    Requires the download URL (likely obtained from opus_check_job_status).
-    Optionally specify a base name for the new container node.
-    (Houdini needs a corresponding 'import_opus_url' command handler)
-    """
-    if not download_url:
-        return "Error: Download URL cannot be empty."
-    try:
-        conn = get_houdini_connection()
-        params = {"url": download_url}
-        # Use provided name or generate one from URL
-        if node_name:
-             params["node_name"] = node_name
-        else:
-             # Basic name generation from URL
-             try:
-                 parsed_name = os.path.splitext(os.path.basename(urlparse(download_url).path))[0]
-                 params["node_name"] = hou.nodeType(hou.nodeTypeCategories()["Object"], "subnet").instance(parsed_name) # Generate unique name
-             except Exception:
-                 params["node_name"] = "opus_import" # Fallback name
-             
-        logger.info(f"Requesting Houdini import: URL={download_url}, NodeName={params['node_name']}")
-        # Send command to Houdini's server.py
-        response = conn.send_command("import_opus_url", params)
+def disconnect_node_input(ctx: Context, node_path: str, input_index: int = 0) -> str:
+    """Disconnect a specific input on a node."""
+    return _send_tool_command("disconnect_node_input", {
+        "node_path": node_path,
+        "input_index": input_index,
+    })
 
-        if response.get("status") == "error":
-            origin = response.get('origin', 'houdini')
-            return f"Error ({origin}) importing model: {response.get('message', 'Unknown error')}"
+@mcp.tool()
+def set_node_flags(ctx: Context, node_path: str, display: bool = None,
+                   render: bool = None, bypass: bool = None) -> str:
+    """Set display, render, and/or bypass flags on a node."""
+    params = {"node_path": node_path}
+    if display is not None:
+        params["display"] = display
+    if render is not None:
+        params["render"] = render
+    if bypass is not None:
+        params["bypass"] = bypass
+    return _send_tool_command("set_node_flags", params)
 
-        # Assuming success returns a dict in 'result' with import info (e.g., new node path)
-        result_data = response.get('result', {})
-        return f"Import Result: {json.dumps(result_data)}"
+@mcp.tool()
+def save_scene(ctx: Context, file_path: str = None) -> str:
+    """Save the current Houdini scene, optionally to a new file path."""
+    params = {}
+    if file_path is not None:
+        params["file_path"] = file_path
+    return _send_tool_command("save_scene", params)
 
-    except ConnectionError as e:
-         return f"Connection Error importing model: {str(e)}"
-    except Exception as e:
-        logger.error(f"Unexpected error in opus_import_model_url tool: {str(e)}", exc_info=True)
-        return f"Server Error importing model: {str(e)}"
+@mcp.tool()
+def load_scene(ctx: Context, file_path: str = "") -> str:
+    """Load a .hip file into Houdini."""
+    return _send_tool_command("load_scene", {"file_path": file_path})
 
-# --- Add get_opus_job_result helper (Updated for RapidAPI) --- 
-def get_opus_job_result(batch_job_id: str) -> dict:
+@mcp.tool()
+def set_expression(ctx: Context, node_path: str, parm_name: str,
+                   expression: str, language: str = "hscript") -> str:
+    """Set an expression on a node parameter. Language: 'hscript' or 'python'."""
+    return _send_tool_command("set_expression", {
+        "node_path": node_path,
+        "parm_name": parm_name,
+        "expression": expression,
+        "language": language,
+    })
+
+@mcp.tool()
+def set_frame(ctx: Context, frame: float = 1.0) -> str:
+    """Set the current frame in Houdini's playbar."""
+    return _send_tool_command("set_frame", {"frame": frame})
+
+@mcp.tool()
+def get_geo_summary(ctx: Context, node_path: str) -> str:
+    """Get geometry stats: point/prim/vertex counts, bounding box, attribute names."""
+    return _send_tool_command("get_geo_summary", {"node_path": node_path})
+
+@mcp.tool()
+def layout_children(ctx: Context, node_path: str = "/obj") -> str:
+    """Auto-layout child nodes in the network editor."""
+    return _send_tool_command("layout_children", {"node_path": node_path})
+
+@mcp.tool()
+def set_node_color(ctx: Context, node_path: str, color: List[float] = [1, 1, 1]) -> str:
+    """Set a node's color as [r, g, b] (0-1 range)."""
+    return _send_tool_command("set_node_color", {"node_path": node_path, "color": color})
+
+@mcp.tool()
+def find_error_nodes(ctx: Context, root_path: str = "/obj") -> str:
+    """Scan the node hierarchy for cook errors and warnings."""
+    return _send_tool_command("find_error_nodes", {"root_path": root_path})
+
+
+# ── Context tools ──
+
+@mcp.tool()
+def get_network_overview(ctx: Context, path: str = "/obj") -> str:
+    """Get an overview of all nodes in a network with their connections."""
+    return _send_tool_command("get_network_overview", {"path": path})
+
+@mcp.tool()
+def get_cook_chain(ctx: Context, path: str) -> str:
+    """Get the cook dependency chain for a node (inputs all the way up)."""
+    return _send_tool_command("get_cook_chain", {"path": path})
+
+@mcp.tool()
+def explain_node(ctx: Context, path: str) -> str:
+    """Get a human-readable explanation of a node: type, non-default parms, connections."""
+    return _send_tool_command("explain_node", {"path": path})
+
+@mcp.tool()
+def get_scene_summary(ctx: Context) -> str:
+    """Get a high-level summary of the entire scene: node counts by category, frame info."""
+    return _send_tool_command("get_scene_summary")
+
+@mcp.tool()
+def get_selection(ctx: Context) -> str:
+    """Get the currently selected nodes in Houdini."""
+    return _send_tool_command("get_selection")
+
+@mcp.tool()
+def set_selection(ctx: Context, paths: List[str]) -> str:
+    """Set the node selection to the given list of node paths."""
+    return _send_tool_command("set_selection", {"paths": paths})
+
+# ── Parameter tools ──
+
+@mcp.tool()
+def get_parameter(ctx: Context, node_path: str, parm_name: str) -> str:
+    """Get a single parameter's value, type, expression, and metadata."""
+    return _send_tool_command("get_parameter", {"node_path": node_path, "parm_name": parm_name})
+
+@mcp.tool()
+def set_parameter(ctx: Context, node_path: str, parm_name: str, value: Any) -> str:
+    """Set a single parameter value on a node."""
+    return _send_tool_command("set_parameter", {"node_path": node_path, "parm_name": parm_name, "value": value})
+
+@mcp.tool()
+def set_parameters(ctx: Context, node_path: str, parameters: Dict[str, Any]) -> str:
+    """Set multiple parameters at once on a node."""
+    return _send_tool_command("set_parameters", {"node_path": node_path, "parameters": parameters})
+
+@mcp.tool()
+def get_parameter_schema(ctx: Context, node_path: str) -> str:
+    """Get the full parameter schema (all parm templates) for a node."""
+    return _send_tool_command("get_parameter_schema", {"node_path": node_path})
+
+@mcp.tool()
+def get_expression(ctx: Context, node_path: str, parm_name: str) -> str:
+    """Get the expression set on a parameter, if any."""
+    return _send_tool_command("get_expression", {"node_path": node_path, "parm_name": parm_name})
+
+@mcp.tool()
+def revert_parameter(ctx: Context, node_path: str, parm_name: str) -> str:
+    """Revert a parameter to its default value."""
+    return _send_tool_command("revert_parameter", {"node_path": node_path, "parm_name": parm_name})
+
+@mcp.tool()
+def link_parameters(ctx: Context, src_path: str, src_parm: str,
+                    dst_path: str, dst_parm: str) -> str:
+    """Create a channel reference from dst_parm to src_parm."""
+    return _send_tool_command("link_parameters", {
+        "src_path": src_path, "src_parm": src_parm,
+        "dst_path": dst_path, "dst_parm": dst_parm,
+    })
+
+@mcp.tool()
+def lock_parameter(ctx: Context, node_path: str, parm_name: str,
+                   locked: bool = True) -> str:
+    """Lock or unlock a parameter."""
+    return _send_tool_command("lock_parameter", {
+        "node_path": node_path, "parm_name": parm_name, "locked": locked,
+    })
+
+@mcp.tool()
+def create_spare_parameter(ctx: Context, node_path: str, name: str,
+                           label: str, parm_type: str, default: Any = None) -> str:
+    """Add a spare parameter to a node. Types: float, int, string, toggle."""
+    params = {"node_path": node_path, "name": name, "label": label, "parm_type": parm_type}
+    if default is not None:
+        params["default"] = default
+    return _send_tool_command("create_spare_parameter", params)
+
+@mcp.tool()
+def create_spare_parameters(ctx: Context, node_path: str,
+                            parameters: List[Dict[str, Any]]) -> str:
+    """Add multiple spare parameters to a node at once."""
+    return _send_tool_command("create_spare_parameters", {
+        "node_path": node_path, "parameters": parameters,
+    })
+
+# ── Animation tools ──
+
+@mcp.tool()
+def set_keyframe(ctx: Context, node_path: str, parm_name: str,
+                 frame: float, value: float) -> str:
+    """Set a keyframe on a parameter at a specific frame."""
+    return _send_tool_command("set_keyframe", {
+        "node_path": node_path, "parm_name": parm_name, "frame": frame, "value": value,
+    })
+
+@mcp.tool()
+def set_keyframes(ctx: Context, node_path: str, parm_name: str,
+                  keyframes: List[Dict[str, float]]) -> str:
+    """Set multiple keyframes. Each: {frame, value}."""
+    return _send_tool_command("set_keyframes", {
+        "node_path": node_path, "parm_name": parm_name, "keyframes": keyframes,
+    })
+
+@mcp.tool()
+def delete_keyframe(ctx: Context, node_path: str, parm_name: str, frame: float) -> str:
+    """Delete a keyframe at a specific frame."""
+    return _send_tool_command("delete_keyframe", {
+        "node_path": node_path, "parm_name": parm_name, "frame": frame,
+    })
+
+@mcp.tool()
+def get_keyframes(ctx: Context, node_path: str, parm_name: str) -> str:
+    """Get all keyframes on a parameter."""
+    return _send_tool_command("get_keyframes", {"node_path": node_path, "parm_name": parm_name})
+
+@mcp.tool()
+def get_frame(ctx: Context) -> str:
+    """Get the current frame and time."""
+    return _send_tool_command("get_frame")
+
+@mcp.tool()
+def set_frame_range(ctx: Context, start: float, end: float) -> str:
+    """Set the global animation frame range."""
+    return _send_tool_command("set_frame_range", {"start": start, "end": end})
+
+@mcp.tool()
+def set_playback_range(ctx: Context, start: float, end: float) -> str:
+    """Set the playback range (subset of the global range)."""
+    return _send_tool_command("set_playback_range", {"start": start, "end": end})
+
+@mcp.tool()
+def playbar_control(ctx: Context, action: str) -> str:
+    """Control playbar: play, stop, reverse, step_forward, step_backward."""
+    return _send_tool_command("playbar_control", {"action": action})
+
+# ── VEX tools ──
+
+@mcp.tool()
+def create_wrangle(ctx: Context, parent_path: str,
+                   wrangle_type: str = "attribwrangle",
+                   name: str = None, code: str = "") -> str:
+    """Create a VEX wrangle node with optional initial code."""
+    params = {"parent_path": parent_path, "wrangle_type": wrangle_type, "code": code}
+    if name is not None:
+        params["name"] = name
+    return _send_tool_command("create_wrangle", params)
+
+@mcp.tool()
+def set_wrangle_code(ctx: Context, node_path: str, code: str) -> str:
+    """Set the VEX code on a wrangle node."""
+    return _send_tool_command("set_wrangle_code", {"node_path": node_path, "code": code})
+
+@mcp.tool()
+def get_wrangle_code(ctx: Context, node_path: str) -> str:
+    """Get the VEX code from a wrangle node."""
+    return _send_tool_command("get_wrangle_code", {"node_path": node_path})
+
+@mcp.tool()
+def create_vex_expression(ctx: Context, parent_path: str, attrib_name: str,
+                          expression: str, run_over: str = "Points") -> str:
+    """Create a wrangle that evaluates a VEX expression into an attribute."""
+    return _send_tool_command("create_vex_expression", {
+        "parent_path": parent_path, "attrib_name": attrib_name,
+        "expression": expression, "run_over": run_over,
+    })
+
+@mcp.tool()
+def validate_vex(ctx: Context, code: str) -> str:
+    """Validate VEX code syntax."""
+    return _send_tool_command("validate_vex", {"code": code})
+
+# ── Material tools ──
+
+@mcp.tool()
+def list_materials(ctx: Context, mat_path: str = "/mat") -> str:
+    """List all materials in a material network."""
+    return _send_tool_command("list_materials", {"mat_path": mat_path})
+
+@mcp.tool()
+def get_material_info(ctx: Context, path: str) -> str:
+    """Get detailed info about a material node."""
+    return _send_tool_command("get_material_info", {"path": path})
+
+@mcp.tool()
+def create_material_network(ctx: Context, parent_path: str = "/obj",
+                            name: str = "matnet") -> str:
+    """Create a material network (matnet) node."""
+    return _send_tool_command("create_material_network", {
+        "parent_path": parent_path, "name": name,
+    })
+
+@mcp.tool()
+def assign_material(ctx: Context, node_path: str, material_path: str) -> str:
+    """Assign a material to a node by setting shop_materialpath."""
+    return _send_tool_command("assign_material", {
+        "node_path": node_path, "material_path": material_path,
+    })
+
+@mcp.tool()
+def list_material_types(ctx: Context) -> str:
+    """List available material/shader node types."""
+    return _send_tool_command("list_material_types")
+
+# ── Nodes expanded tools ──
+
+@mcp.tool()
+def copy_node(ctx: Context, path: str, destination_path: str) -> str:
+    """Copy a node to a new parent network."""
+    return _send_tool_command("copy_node", {"path": path, "destination_path": destination_path})
+
+@mcp.tool()
+def move_node(ctx: Context, path: str, destination_path: str) -> str:
+    """Move a node to a new parent network."""
+    return _send_tool_command("move_node", {"path": path, "destination_path": destination_path})
+
+@mcp.tool()
+def rename_node(ctx: Context, path: str, new_name: str) -> str:
+    """Rename a node."""
+    return _send_tool_command("rename_node", {"path": path, "new_name": new_name})
+
+@mcp.tool()
+def list_children(ctx: Context, path: str, recursive: bool = False) -> str:
+    """List all children of a node, optionally recursive."""
+    return _send_tool_command("list_children", {"path": path, "recursive": recursive})
+
+@mcp.tool()
+def find_nodes(ctx: Context, pattern: str, node_type: str = None,
+               root_path: str = "/") -> str:
+    """Find nodes matching a name pattern, optionally filtered by type."""
+    params = {"pattern": pattern, "root_path": root_path}
+    if node_type is not None:
+        params["node_type"] = node_type
+    return _send_tool_command("find_nodes", params)
+
+@mcp.tool()
+def list_node_types(ctx: Context, category: str = None) -> str:
+    """List available node types, optionally filtered by category."""
+    params = {}
+    if category is not None:
+        params["category"] = category
+    return _send_tool_command("list_node_types", params)
+
+@mcp.tool()
+def connect_nodes_batch(ctx: Context, connections: List[Dict[str, Any]]) -> str:
+    """Connect multiple node pairs at once. Each: {src_path, dst_path, dst_input_index, src_output_index}."""
+    return _send_tool_command("connect_nodes_batch", {"connections": connections})
+
+@mcp.tool()
+def reorder_inputs(ctx: Context, path: str, input_indices: List[int]) -> str:
+    """Reorder the inputs of a node by specifying the new index order."""
+    return _send_tool_command("reorder_inputs", {"path": path, "input_indices": input_indices})
+
+# ── Geometry expanded tools ──
+
+@mcp.tool()
+def get_points(ctx: Context, node_path: str, start: int = 0,
+               count: int = 100, attribs: List[str] = None) -> str:
+    """Get point data with pagination. Returns positions and optional attrib values."""
+    params = {"node_path": node_path, "start": start, "count": count}
+    if attribs is not None:
+        params["attribs"] = attribs
+    return _send_tool_command("get_points", params)
+
+@mcp.tool()
+def get_prims(ctx: Context, node_path: str, start: int = 0,
+              count: int = 100, attribs: List[str] = None) -> str:
+    """Get primitive data with pagination."""
+    params = {"node_path": node_path, "start": start, "count": count}
+    if attribs is not None:
+        params["attribs"] = attribs
+    return _send_tool_command("get_prims", params)
+
+@mcp.tool()
+def get_attrib_values(ctx: Context, node_path: str, attrib_name: str,
+                      attrib_class: str = "point") -> str:
+    """Get all values of a geometry attribute. attrib_class: point, prim, detail."""
+    return _send_tool_command("get_attrib_values", {
+        "node_path": node_path, "attrib_name": attrib_name, "attrib_class": attrib_class,
+    })
+
+@mcp.tool()
+def set_detail_attrib(ctx: Context, node_path: str, attrib_name: str, value: Any) -> str:
+    """Set a detail (global) attribute value on geometry."""
+    return _send_tool_command("set_detail_attrib", {
+        "node_path": node_path, "attrib_name": attrib_name, "value": value,
+    })
+
+@mcp.tool()
+def get_groups(ctx: Context, node_path: str, group_type: str = "point") -> str:
+    """List geometry groups. group_type: point, prim, edge, vertex."""
+    return _send_tool_command("get_groups", {"node_path": node_path, "group_type": group_type})
+
+@mcp.tool()
+def get_group_members(ctx: Context, node_path: str, group_name: str,
+                      group_type: str = "point") -> str:
+    """Get the members of a geometry group."""
+    return _send_tool_command("get_group_members", {
+        "node_path": node_path, "group_name": group_name, "group_type": group_type,
+    })
+
+@mcp.tool()
+def get_bounding_box(ctx: Context, node_path: str) -> str:
+    """Get the bounding box of a node's geometry (min, max, size, center)."""
+    return _send_tool_command("get_bounding_box", {"node_path": node_path})
+
+@mcp.tool()
+def get_prim_intrinsics(ctx: Context, node_path: str, prim_index: int = 0) -> str:
+    """Get intrinsic values of a primitive."""
+    return _send_tool_command("get_prim_intrinsics", {"node_path": node_path, "prim_index": prim_index})
+
+@mcp.tool()
+def find_nearest_point(ctx: Context, node_path: str, position: List[float]) -> str:
+    """Find the nearest point to a given position in world space."""
+    return _send_tool_command("find_nearest_point", {"node_path": node_path, "position": position})
+
+# ── Code expanded tools ──
+
+@mcp.tool()
+def execute_hscript(ctx: Context, command: str) -> str:
+    """Execute an HScript command and return stdout/stderr."""
+    return _send_tool_command("execute_hscript", {"command": command})
+
+@mcp.tool()
+def evaluate_expression(ctx: Context, expression: str, language: str = "hscript") -> str:
+    """Evaluate a Houdini expression and return the result."""
+    return _send_tool_command("evaluate_expression", {"expression": expression, "language": language})
+
+@mcp.tool()
+def get_env_variable(ctx: Context, name: str) -> str:
+    """Get a Houdini environment variable ($HIP, $JOB, etc.)."""
+    return _send_tool_command("get_env_variable", {"name": name})
+
+# ── PDG tools ──
+
+@mcp.tool()
+def pdg_cook(ctx: Context, path: str) -> str:
+    """Start cooking a TOP network (non-blocking)."""
+    return _send_tool_command("pdg_cook", {"path": path})
+
+@mcp.tool()
+def pdg_status(ctx: Context, path: str) -> str:
+    """Get cook status and work item counts for a TOP network."""
+    return _send_tool_command("pdg_status", {"path": path})
+
+@mcp.tool()
+def pdg_workitems(ctx: Context, path: str, state: str = None) -> str:
+    """List work items for a TOP node, optionally filtered by state."""
+    params = {"path": path}
+    if state is not None:
+        params["state"] = state
+    return _send_tool_command("pdg_workitems", params)
+
+@mcp.tool()
+def pdg_dirty(ctx: Context, path: str, dirty_all: bool = False) -> str:
+    """Dirty work items on a TOP node for re-cooking."""
+    return _send_tool_command("pdg_dirty", {"path": path, "dirty_all": dirty_all})
+
+@mcp.tool()
+def pdg_cancel(ctx: Context, path: str) -> str:
+    """Cancel a running PDG cook."""
+    return _send_tool_command("pdg_cancel", {"path": path})
+
+@mcp.tool()
+def lop_stage_info(ctx: Context, path: str) -> str:
+    """Get USD stage info from a LOP node: prims, layers, time codes."""
+    return _send_tool_command("lop_stage_info", {"path": path})
+
+@mcp.tool()
+def lop_prim_get(ctx: Context, path: str, prim_path: str,
+                 include_attrs: bool = False) -> str:
+    """Get details of a specific USD prim."""
+    return _send_tool_command("lop_prim_get", {
+        "path": path, "prim_path": prim_path, "include_attrs": include_attrs,
+    })
+
+@mcp.tool()
+def lop_prim_search(ctx: Context, path: str, pattern: str,
+                    type_name: str = None) -> str:
+    """Search for USD prims matching a pattern."""
+    params = {"path": path, "pattern": pattern}
+    if type_name is not None:
+        params["type_name"] = type_name
+    return _send_tool_command("lop_prim_search", params)
+
+@mcp.tool()
+def lop_layer_info(ctx: Context, path: str) -> str:
+    """Get USD layer stack info from a LOP node."""
+    return _send_tool_command("lop_layer_info", {"path": path})
+
+@mcp.tool()
+def lop_import(ctx: Context, path: str, file: str,
+               method: str = "reference", prim_path: str = None) -> str:
+    """Import a USD file via reference or sublayer."""
+    params = {"path": path, "file": file, "method": method}
+    if prim_path is not None:
+        params["prim_path"] = prim_path
+    return _send_tool_command("lop_import", params)
+
+@mcp.tool()
+def hda_list(ctx: Context, category: str = None) -> str:
+    """List available HDA definitions, optionally filtered by category."""
+    params = {}
+    if category is not None:
+        params["category"] = category
+    return _send_tool_command("hda_list", params)
+
+@mcp.tool()
+def hda_get(ctx: Context, node_type: str, category: str = None) -> str:
+    """Get detailed info about an HDA definition."""
+    params = {"node_type": node_type}
+    if category is not None:
+        params["category"] = category
+    return _send_tool_command("hda_get", params)
+
+@mcp.tool()
+def hda_install(ctx: Context, file_path: str) -> str:
+    """Install an HDA file into the current Houdini session."""
+    return _send_tool_command("hda_install", {"file_path": file_path})
+
+@mcp.tool()
+def hda_create(ctx: Context, node_path: str, name: str,
+               label: str, file_path: str) -> str:
+    """Create an HDA from an existing node."""
+    return _send_tool_command("hda_create", {
+        "node_path": node_path, "name": name, "label": label, "file_path": file_path,
+    })
+
+@mcp.tool()
+def batch(ctx: Context, operations: List[Dict[str, Any]] = []) -> str:
+    """Execute multiple operations atomically in a single undo group.
+    Each operation: {"type": "create_node", "params": {...}}."""
+    return _send_tool_command("batch", {"operations": operations})
+
+@mcp.tool()
+def geo_export(ctx: Context, node_path: str, format: str = "obj",
+               output: str = None) -> str:
+    """Export geometry to a file. Formats: obj, gltf, glb, usd, usda, ply, bgeo.sc."""
+    params = {"node_path": node_path, "format": format}
+    if output is not None:
+        params["output"] = output
+    return _send_tool_command("geo_export", params)
+
+@mcp.tool()
+def render_flipbook(ctx: Context, frame_range: List[float] = None,
+                    output: str = None, resolution: List[int] = None) -> str:
+    """Render a flipbook sequence from the viewport."""
+    params = {}
+    if frame_range is not None:
+        params["frame_range"] = frame_range
+    if output is not None:
+        params["output"] = output
+    if resolution is not None:
+        params["resolution"] = resolution
+    return _send_tool_command("render_flipbook", params)
+
+
+# ── DOP tools ──
+
+@mcp.tool()
+def get_simulation_info(ctx: Context, path: str) -> str:
+    """Get simulation info from a DOP network."""
+    return _send_tool_command("get_simulation_info", {"path": path})
+
+@mcp.tool()
+def list_dop_objects(ctx: Context, path: str) -> str:
+    """List all DOP objects in a simulation."""
+    return _send_tool_command("list_dop_objects", {"path": path})
+
+@mcp.tool()
+def get_dop_object(ctx: Context, path: str, object_name: str) -> str:
+    """Get info about a specific DOP object."""
+    return _send_tool_command("get_dop_object", {"path": path, "object_name": object_name})
+
+@mcp.tool()
+def get_dop_field(ctx: Context, path: str, object_name: str, field_name: str) -> str:
+    """Get a specific field from a DOP object."""
+    return _send_tool_command("get_dop_field", {
+        "path": path, "object_name": object_name, "field_name": field_name,
+    })
+
+@mcp.tool()
+def get_dop_relationships(ctx: Context, path: str, object_name: str) -> str:
+    """Get relationships of a DOP object."""
+    return _send_tool_command("get_dop_relationships", {"path": path, "object_name": object_name})
+
+@mcp.tool()
+def step_simulation(ctx: Context, path: str, num_steps: int = 1) -> str:
+    """Step a simulation forward by a number of frames."""
+    return _send_tool_command("step_simulation", {"path": path, "num_steps": num_steps})
+
+@mcp.tool()
+def reset_simulation(ctx: Context, path: str) -> str:
+    """Reset a simulation to its initial state."""
+    return _send_tool_command("reset_simulation", {"path": path})
+
+@mcp.tool()
+def get_sim_memory_usage(ctx: Context, path: str) -> str:
+    """Get memory usage of a simulation."""
+    return _send_tool_command("get_sim_memory_usage", {"path": path})
+
+# ── Viewport tools ──
+
+@mcp.tool()
+def list_panes(ctx: Context) -> str:
+    """List all pane tabs in the Houdini desktop."""
+    return _send_tool_command("list_panes")
+
+@mcp.tool()
+def get_viewport_info(ctx: Context) -> str:
+    """Get current viewport settings (camera, shading, etc.)."""
+    return _send_tool_command("get_viewport_info")
+
+@mcp.tool()
+def set_viewport_camera(ctx: Context, camera_path: str) -> str:
+    """Set the viewport camera to a specific camera node."""
+    return _send_tool_command("set_viewport_camera", {"camera_path": camera_path})
+
+@mcp.tool()
+def set_viewport_display(ctx: Context, shading_mode: str = None,
+                         guide: bool = None) -> str:
+    """Set viewport display options (shading mode, guides)."""
+    params = {}
+    if shading_mode is not None:
+        params["shading_mode"] = shading_mode
+    if guide is not None:
+        params["guide"] = guide
+    return _send_tool_command("set_viewport_display", params)
+
+@mcp.tool()
+def set_viewport_renderer(ctx: Context, renderer: str) -> str:
+    """Set the viewport renderer."""
+    return _send_tool_command("set_viewport_renderer", {"renderer": renderer})
+
+@mcp.tool()
+def frame_selection(ctx: Context) -> str:
+    """Frame the viewport on the current selection."""
+    return _send_tool_command("frame_selection")
+
+@mcp.tool()
+def frame_all(ctx: Context) -> str:
+    """Frame the viewport on all geometry."""
+    return _send_tool_command("frame_all")
+
+@mcp.tool()
+def set_viewport_direction(ctx: Context, direction: str) -> str:
+    """Set viewport direction: front, back, left, right, top, bottom, persp."""
+    return _send_tool_command("set_viewport_direction", {"direction": direction})
+
+@mcp.tool()
+def capture_screenshot(ctx: Context, output_path: str = None) -> str:
+    """Capture a screenshot of the current viewport."""
+    params = {}
+    if output_path is not None:
+        params["output_path"] = output_path
+    return _send_tool_command("capture_screenshot", params)
+
+@mcp.tool()
+def set_current_network(ctx: Context, path: str) -> str:
+    """Set the current network path in the network editor."""
+    return _send_tool_command("set_current_network", {"path": path})
+
+# ── Rendering expanded tools ──
+
+@mcp.tool()
+def list_render_nodes(ctx: Context) -> str:
+    """List all ROP (render) nodes in the scene."""
+    return _send_tool_command("list_render_nodes")
+
+@mcp.tool()
+def get_render_settings(ctx: Context, path: str) -> str:
+    """Get render settings from a ROP node."""
+    return _send_tool_command("get_render_settings", {"path": path})
+
+@mcp.tool()
+def set_render_settings(ctx: Context, path: str, settings: Dict[str, Any]) -> str:
+    """Set render settings on a ROP node."""
+    return _send_tool_command("set_render_settings", {"path": path, "settings": settings})
+
+@mcp.tool()
+def create_render_node(ctx: Context, render_type: str = "opengl",
+                       name: str = None, parent_path: str = "/out") -> str:
+    """Create a ROP (render) node."""
+    params = {"render_type": render_type, "parent_path": parent_path}
+    if name is not None:
+        params["name"] = name
+    return _send_tool_command("create_render_node", params)
+
+@mcp.tool()
+def start_render(ctx: Context, path: str, frame_range: List[float] = None) -> str:
+    """Start a render from a ROP node."""
+    params = {"path": path}
+    if frame_range is not None:
+        params["frame_range"] = frame_range
+    return _send_tool_command("start_render", params)
+
+@mcp.tool()
+def get_render_progress(ctx: Context, path: str) -> str:
+    """Get render progress from a ROP node."""
+    return _send_tool_command("get_render_progress", {"path": path})
+
+# ── COP tools ──
+
+@mcp.tool()
+def get_cop_info(ctx: Context, path: str) -> str:
+    """Get info about a COP node: resolution, planes, depth."""
+    return _send_tool_command("get_cop_info", {"path": path})
+
+@mcp.tool()
+def get_cop_geometry(ctx: Context, path: str) -> str:
+    """Get geometry data from a COP node."""
+    return _send_tool_command("get_cop_geometry", {"path": path})
+
+@mcp.tool()
+def get_cop_layer(ctx: Context, path: str, plane_name: str = "C") -> str:
+    """Get info about a specific plane/layer in a COP node."""
+    return _send_tool_command("get_cop_layer", {"path": path, "plane_name": plane_name})
+
+@mcp.tool()
+def create_cop_node(ctx: Context, parent_path: str, node_type: str,
+                    name: str = None) -> str:
+    """Create a COP node."""
+    params = {"parent_path": parent_path, "node_type": node_type}
+    if name is not None:
+        params["name"] = name
+    return _send_tool_command("create_cop_node", params)
+
+@mcp.tool()
+def set_cop_flags(ctx: Context, node_path: str, display: bool = None,
+                  render: bool = None, bypass: bool = None) -> str:
+    """Set display/render/bypass flags on a COP node."""
+    params = {"node_path": node_path}
+    if display is not None:
+        params["display"] = display
+    if render is not None:
+        params["render"] = render
+    if bypass is not None:
+        params["bypass"] = bypass
+    return _send_tool_command("set_cop_flags", params)
+
+@mcp.tool()
+def list_cop_node_types(ctx: Context) -> str:
+    """List available COP node types."""
+    return _send_tool_command("list_cop_node_types")
+
+@mcp.tool()
+def get_cop_vdb(ctx: Context, path: str) -> str:
+    """Get VDB info from a COP node."""
+    return _send_tool_command("get_cop_vdb", {"path": path})
+
+# ── CHOP tools ──
+
+@mcp.tool()
+def get_chop_data(ctx: Context, path: str, channel: str = None,
+                  start: int = None, end: int = None) -> str:
+    """Get CHOP channel data, optionally for a specific channel and sample range."""
+    params = {"path": path}
+    if channel is not None:
+        params["channel"] = channel
+    if start is not None:
+        params["start"] = start
+    if end is not None:
+        params["end"] = end
+    return _send_tool_command("get_chop_data", params)
+
+@mcp.tool()
+def create_chop_node(ctx: Context, parent_path: str, node_type: str,
+                     name: str = None) -> str:
+    """Create a CHOP node."""
+    params = {"parent_path": parent_path, "node_type": node_type}
+    if name is not None:
+        params["name"] = name
+    return _send_tool_command("create_chop_node", params)
+
+@mcp.tool()
+def list_chop_channels(ctx: Context, path: str) -> str:
+    """List all channels in a CHOP node."""
+    return _send_tool_command("list_chop_channels", {"path": path})
+
+@mcp.tool()
+def export_chop_to_parm(ctx: Context, chop_path: str, channel_name: str,
+                        target_path: str, parm_name: str) -> str:
+    """Export a CHOP channel to a parameter via expression."""
+    return _send_tool_command("export_chop_to_parm", {
+        "chop_path": chop_path, "channel_name": channel_name,
+        "target_path": target_path, "parm_name": parm_name,
+    })
+
+# ── Takes tools ──
+
+@mcp.tool()
+def list_takes(ctx: Context) -> str:
+    """List all takes in the scene."""
+    return _send_tool_command("list_takes")
+
+@mcp.tool()
+def get_current_take(ctx: Context) -> str:
+    """Get the current take."""
+    return _send_tool_command("get_current_take")
+
+@mcp.tool()
+def set_current_take(ctx: Context, take_name: str) -> str:
+    """Set the current take by name."""
+    return _send_tool_command("set_current_take", {"take_name": take_name})
+
+@mcp.tool()
+def create_take(ctx: Context, name: str, parent_name: str = None) -> str:
+    """Create a new take, optionally under a parent take."""
+    params = {"name": name}
+    if parent_name is not None:
+        params["parent_name"] = parent_name
+    return _send_tool_command("create_take", params)
+
+# ── Cache tools ──
+
+@mcp.tool()
+def list_caches(ctx: Context, root_path: str = "/obj") -> str:
+    """List all nodes with cache data."""
+    return _send_tool_command("list_caches", {"root_path": root_path})
+
+@mcp.tool()
+def get_cache_status(ctx: Context, path: str) -> str:
+    """Get cache status for a file cache node."""
+    return _send_tool_command("get_cache_status", {"path": path})
+
+@mcp.tool()
+def clear_cache(ctx: Context, path: str) -> str:
+    """Clear cache on a file cache node."""
+    return _send_tool_command("clear_cache", {"path": path})
+
+@mcp.tool()
+def write_cache(ctx: Context, path: str, frame_range: List[float] = None) -> str:
+    """Write cache for a file cache node."""
+    params = {"path": path}
+    if frame_range is not None:
+        params["frame_range"] = frame_range
+    return _send_tool_command("write_cache", params)
+
+# ── USD/LOP expanded tools ──
+
+@mcp.tool()
+def list_usd_prims(ctx: Context, path: str, root_prim: str = "/",
+                   max_depth: int = 3) -> str:
+    """List USD prims up to a given depth."""
+    return _send_tool_command("list_usd_prims", {"path": path, "root_prim": root_prim, "max_depth": max_depth})
+
+@mcp.tool()
+def get_usd_attribute(ctx: Context, path: str, prim_path: str,
+                      attr_name: str) -> str:
+    """Get a specific USD attribute value."""
+    return _send_tool_command("get_usd_attribute", {
+        "path": path, "prim_path": prim_path, "attr_name": attr_name,
+    })
+
+@mcp.tool()
+def set_usd_attribute(ctx: Context, path: str, prim_path: str,
+                      attr_name: str, value: Any) -> str:
+    """Set a USD attribute value."""
+    return _send_tool_command("set_usd_attribute", {
+        "path": path, "prim_path": prim_path, "attr_name": attr_name, "value": value,
+    })
+
+@mcp.tool()
+def get_usd_prim_stats(ctx: Context, path: str, prim_path: str) -> str:
+    """Get stats about a USD prim: child count, attr count, active, payload."""
+    return _send_tool_command("get_usd_prim_stats", {"path": path, "prim_path": prim_path})
+
+@mcp.tool()
+def get_last_modified_prims(ctx: Context, path: str, count: int = 10) -> str:
+    """Get recently modified prims from the edit target layer."""
+    return _send_tool_command("get_last_modified_prims", {"path": path, "count": count})
+
+@mcp.tool()
+def create_lop_node(ctx: Context, parent_path: str, node_type: str,
+                    name: str = None) -> str:
+    """Create a LOP node."""
+    params = {"parent_path": parent_path, "node_type": node_type}
+    if name is not None:
+        params["name"] = name
+    return _send_tool_command("create_lop_node", params)
+
+@mcp.tool()
+def get_usd_composition(ctx: Context, path: str, prim_path: str) -> str:
+    """Get composition arcs (references, payloads, inherits, specializes) for a prim."""
+    return _send_tool_command("get_usd_composition", {"path": path, "prim_path": prim_path})
+
+@mcp.tool()
+def get_usd_variants(ctx: Context, path: str, prim_path: str) -> str:
+    """Get variant sets and selections for a USD prim."""
+    return _send_tool_command("get_usd_variants", {"path": path, "prim_path": prim_path})
+
+@mcp.tool()
+def inspect_usd_layer(ctx: Context, path: str, layer_index: int = 0) -> str:
+    """Inspect a specific USD layer by index in the stack."""
+    return _send_tool_command("inspect_usd_layer", {"path": path, "layer_index": layer_index})
+
+@mcp.tool()
+def list_lights(ctx: Context, path: str) -> str:
+    """List all light prims in a USD stage."""
+    return _send_tool_command("list_lights", {"path": path})
+
+# ── Workflow template tools ──
+
+@mcp.tool()
+def setup_pyro_sim(ctx: Context, source_path: str, name: str = "pyro_sim",
+                   parent_path: str = "/obj") -> str:
+    """Set up a Pyro simulation from a source geometry."""
+    return _send_tool_command("setup_pyro_sim", {
+        "source_path": source_path, "name": name, "parent_path": parent_path,
+    })
+
+@mcp.tool()
+def setup_rbd_sim(ctx: Context, source_path: str, name: str = "rbd_sim",
+                  parent_path: str = "/obj") -> str:
+    """Set up an RBD simulation from a source geometry."""
+    return _send_tool_command("setup_rbd_sim", {
+        "source_path": source_path, "name": name, "parent_path": parent_path,
+    })
+
+@mcp.tool()
+def setup_flip_sim(ctx: Context, source_path: str, name: str = "flip_sim",
+                   parent_path: str = "/obj") -> str:
+    """Set up a FLIP fluid simulation from a source geometry."""
+    return _send_tool_command("setup_flip_sim", {
+        "source_path": source_path, "name": name, "parent_path": parent_path,
+    })
+
+@mcp.tool()
+def setup_vellum_sim(ctx: Context, source_path: str, sim_type: str = "cloth",
+                     name: str = "vellum_sim", parent_path: str = "/obj") -> str:
+    """Set up a Vellum simulation (cloth, hair, grain)."""
+    return _send_tool_command("setup_vellum_sim", {
+        "source_path": source_path, "sim_type": sim_type, "name": name, "parent_path": parent_path,
+    })
+
+@mcp.tool()
+def create_material_workflow(ctx: Context, name: str = "mat_principled",
+                             parent_path: str = "/mat",
+                             material_type: str = "principledshader") -> str:
+    """Create a material node in a material context."""
+    return _send_tool_command("create_material_workflow", {
+        "name": name, "parent_path": parent_path, "material_type": material_type,
+    })
+
+@mcp.tool()
+def assign_material_workflow(ctx: Context, geo_path: str, material_path: str) -> str:
+    """Assign a material to a geometry node."""
+    return _send_tool_command("assign_material_workflow", {
+        "geo_path": geo_path, "material_path": material_path,
+    })
+
+@mcp.tool()
+def build_sop_chain(ctx: Context, parent_path: str,
+                    nodes: List[Dict[str, Any]]) -> str:
+    """Build a chain of SOP nodes connected in sequence. Each: {type, name?, parameters?}."""
+    return _send_tool_command("build_sop_chain", {"parent_path": parent_path, "nodes": nodes})
+
+@mcp.tool()
+def setup_render(ctx: Context, camera_path: str = None,
+                 render_engine: str = "karma", output_path: str = None) -> str:
+    """Set up a render node in /out with camera and output path."""
+    params = {"render_engine": render_engine}
+    if camera_path is not None:
+        params["camera_path"] = camera_path
+    if output_path is not None:
+        params["output_path"] = output_path
+    return _send_tool_command("setup_render", params)
+
+# ── HDA expanded tools ──
+
+@mcp.tool()
+def uninstall_hda(ctx: Context, file_path: str) -> str:
+    """Uninstall an HDA file from the current session."""
+    return _send_tool_command("uninstall_hda", {"file_path": file_path})
+
+@mcp.tool()
+def reload_hda(ctx: Context, file_path: str) -> str:
+    """Reload all HDA definitions from a file."""
+    return _send_tool_command("reload_hda", {"file_path": file_path})
+
+@mcp.tool()
+def update_hda(ctx: Context, node_path: str) -> str:
+    """Update an HDA definition from its current node contents."""
+    return _send_tool_command("update_hda", {"node_path": node_path})
+
+@mcp.tool()
+def get_hda_sections(ctx: Context, node_type: str, category: str = None) -> str:
+    """Get the section names of an HDA."""
+    params = {"node_type": node_type}
+    if category is not None:
+        params["category"] = category
+    return _send_tool_command("get_hda_sections", params)
+
+@mcp.tool()
+def get_hda_section_content(ctx: Context, node_type: str, section_name: str,
+                            category: str = None) -> str:
+    """Get the content of a specific HDA section."""
+    params = {"node_type": node_type, "section_name": section_name}
+    if category is not None:
+        params["category"] = category
+    return _send_tool_command("get_hda_section_content", params)
+
+@mcp.tool()
+def set_hda_section_content(ctx: Context, node_type: str, section_name: str,
+                            content: str, category: str = None) -> str:
+    """Set the content of a specific HDA section."""
+    params = {"node_type": node_type, "section_name": section_name, "content": content}
+    if category is not None:
+        params["category"] = category
+    return _send_tool_command("set_hda_section_content", params)
+
+# ── Event tools ──
+
+@mcp.tool()
+def get_houdini_events(ctx: Context, since: float = None) -> str:
+    """Get pending Houdini events (scene changes, node operations, frame changes).
+    Returns buffered events since last poll and clears the buffer.
+    Optionally pass a timestamp to only get events after that time."""
+    params = {}
+    if since is not None:
+        params["since"] = since
+    return _send_tool_command("get_pending_events", params)
+
+@mcp.tool()
+def subscribe_houdini_events(ctx: Context, types: List[str] = None) -> str:
+    """Configure which Houdini event types to collect.
+    Types: scene_loaded, scene_saved, scene_cleared, node_created, node_deleted, frame_changed.
+    Pass None/empty for all events."""
+    params = {}
+    if types is not None:
+        params["types"] = types
+    return _send_tool_command("subscribe_events", params)
+
+
+@mcp.tool()
+def search_docs(ctx: Context, query: str, top_k: int = 5) -> str:
+    """Search Houdini documentation offline using BM25.
+    Returns ranked results with path, title, preview, and relevance score.
+    Does NOT require a Houdini connection."""
+    from houdini_rag import search_docs as _search
+    results = _search(query, top_k)
+    if isinstance(results, dict) and "error" in results:
+        return f"Error: {results['error']}"
+    return json.dumps(results, indent=2)
+
+@mcp.tool()
+def get_doc(ctx: Context, path: str) -> str:
+    """Get the full content of a Houdini documentation page by its relative path
+    (as returned by search_docs). Does NOT require a Houdini connection."""
+    from houdini_rag import get_doc_content
+    result = get_doc_content(path)
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return json.dumps(result, indent=2)
+
+
+_RENDER_PROCESS_NAMES = ("husk", "mantra-bin")
+
+
+def _find_render_processes() -> List[Dict[str, str]]:
+    """Detect running husk/mantra-bin processes via OS process listing.
+
+    Returns a list of dicts with keys: name, pid, cpu_time, command.
+    Works on Linux/macOS (ps aux) and Windows (tasklist /FO CSV /V).
     """
-    Query OPUS API via RapidAPI for latest job info (including download URLs).
-    Uses GET_JOB_RESULT_URL constructed from RapidAPI env vars.
-    Returns the JSON response as a dictionary.
-    On error, returns a dictionary with an 'error' key.
-    """
-    if not RAPIDAPI_HOST_URL: # Check RapidAPI config
-        return {"error": "RAPIDAPI_HOST_URL not configured."}
-    if not batch_job_id:
-        return {"error": "batch_job_id cannot be empty."}
-        
-    url = GET_JOB_RESULT_URL # Use RapidAPI URL
-    params = { "result_uid": batch_job_id } # Parameter name from user example, check RapidAPI docs
-    headers = { 
-        "accept": "application/json",
-        'x-rapidapi-host': RAPIDAPI_HOST,
-        'x-rapidapi-key': RAPIDAPI_KEY
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/V"],
+            capture_output=True, text=True, timeout=10,
+        )
+        processes = []
+        for line in result.stdout.splitlines()[1:]:  # skip header
+            lower = line.lower()
+            for name in _RENDER_PROCESS_NAMES:
+                if name in lower:
+                    parts = line.strip('"').split('","')
+                    processes.append({
+                        "name": parts[0] if parts else name,
+                        "pid": parts[1] if len(parts) > 1 else "?",
+                        "cpu_time": parts[7] if len(parts) > 7 else "?",
+                        "command": parts[0] if parts else name,
+                    })
+        return processes
+
+    # Linux / macOS
+    result = subprocess.run(
+        ["ps", "aux"], capture_output=True, text=True, timeout=10,
+    )
+    processes = []
+    for line in result.stdout.splitlines()[1:]:  # skip header
+        lower = line.lower()
+        for name in _RENDER_PROCESS_NAMES:
+            if name in lower:
+                cols = line.split(None, 10)
+                processes.append({
+                    "name": name,
+                    "pid": cols[1] if len(cols) > 1 else "?",
+                    "cpu_time": cols[9] if len(cols) > 9 else "?",
+                    "command": cols[10] if len(cols) > 10 else line.strip(),
+                })
+    return processes
+
+
+@mcp.tool()
+def monitor_render(ctx: Context, output_path: str = None) -> str:
+    """Check if a Karma (husk) or Mantra (mantra-bin) render is still running.
+    Optionally pass output_path to also report file existence and size.
+    No Houdini connection needed — runs on the bridge side."""
+    processes = _find_render_processes()
+    info: Dict[str, Any] = {
+        "rendering": len(processes) > 0,
+        "process_count": len(processes),
+        "processes": processes,
     }
-    try:
-        logger.info(f"Querying job status (RapidAPI): URL={url}, Params={params}")
-        resp = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
-        resp.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        return resp.json()
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"RapidAPI Error {e.response.status_code} getting job result: {e.response.text}")
-        try:
-             # Return the error structure from the API if possible
-             return {"error": e.response.json(), "status_code": e.response.status_code} 
-        except json.JSONDecodeError:
-             return {"error": f"RapidAPI Error {e.response.status_code}: {e.response.text}", "status_code": e.response.status_code}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"RapidAPI request failed getting job result: {str(e)}")
-        return {"error": f"RapidAPI request failed: {str(e)}"}
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode job status RapidAPI response: {str(e)}")
-        return {"error": "Failed to decode job status RapidAPI response."}
-# --- End get_opus_job_result helper ---
+    if output_path is not None:
+        if os.path.exists(output_path):
+            info["output_file"] = {
+                "exists": True,
+                "size_bytes": os.path.getsize(output_path),
+            }
+        else:
+            info["output_file"] = {"exists": False}
+    return json.dumps(info, indent=2)
 
 
-# ... (rest of existing code, main function etc) ...
+# ── MCP Resources ──
+
+@mcp.resource("houdini://scene/info")
+def resource_scene_info() -> str:
+    """Current scene info: filename, node count, frame range, FPS."""
+    return _send_tool_command("get_scene_info")
+
+@mcp.resource("houdini://scene/nodes/{path}")
+def resource_node_info(path: str) -> str:
+    """Detailed info about a node: type, parameters, inputs, outputs."""
+    return _send_tool_command("get_node_info", {"path": f"/{path}"})
+
+@mcp.resource("houdini://scene/tree")
+def resource_scene_tree() -> str:
+    """Full scene node tree (recursive children of /obj)."""
+    return _send_tool_command("list_children", {"path": "/obj", "recursive": True})
+
+@mcp.resource("houdini://errors")
+def resource_errors() -> str:
+    """All cook errors and warnings in the scene."""
+    return _send_tool_command("find_error_nodes", {"root_path": "/obj"})
+
+@mcp.resource("houdini://node-types/{context}")
+def resource_node_types(context: str) -> str:
+    """Available node types for a given category (Sop, Object, Cop2, etc.)."""
+    return _send_tool_command("list_node_types", {"category": context})
+
+@mcp.resource("houdini://hdas")
+def resource_hdas() -> str:
+    """All installed HDA definitions."""
+    return _send_tool_command("hda_list")
+
+@mcp.resource("houdini://geometry/{node_path}/summary")
+def resource_geo_summary(node_path: str) -> str:
+    """Geometry summary for a node: point/prim/vertex counts, bbox, attribs."""
+    return _send_tool_command("get_geo_summary", {"node_path": f"/{node_path}"})
+
+@mcp.resource("houdini://usd/{node_path}/stage")
+def resource_usd_stage(node_path: str) -> str:
+    """USD stage info from a LOP node."""
+    return _send_tool_command("lop_stage_info", {"path": f"/{node_path}"})
+
+
+# ── MCP Prompts ──
+
+@mcp.prompt()
+def procedural_modeling_workflow() -> str:
+    """Guide for building a procedural SOP modeling chain in Houdini."""
+    return """You are helping build a procedural SOP modeling chain in Houdini.
+
+Steps:
+1. Use get_scene_info to understand the current scene
+2. Create a geometry container with create_node (type="geo", parent="/obj")
+3. Build a chain of SOP nodes using build_sop_chain or individual create_node calls
+4. Common SOP types: box, sphere, grid, tube, torus, circle, line
+5. Transform with: xform, blast, delete, group, attribwrangle
+6. Boolean with: boolean, intersect, subtract
+7. Refine with: subdivide, polyextrude, polybevel, remesh
+8. Use connect_nodes to wire them together
+9. Set display/render flags with set_node_flags on the final node
+10. Use layout_children to organize the network
+11. Render with render_single_view to verify the result
+
+Always check for errors with find_error_nodes after building the chain."""
+
+
+@mcp.prompt()
+def usd_scene_assembly() -> str:
+    """Guide for assembling a USD scene with LOPs, materials, and lighting."""
+    return """You are helping assemble a USD scene using Houdini's LOPs (Solaris).
+
+Steps:
+1. Use get_scene_info to check the current scene
+2. Create a LOP network: create_node(type="lopnet", parent="/obj")
+3. Import geometry: create_lop_node with type="sopimport" or lop_import for USD files
+4. Add materials: create_material_workflow, then assign via set_usd_attribute
+5. Add lights: create_lop_node with light types (distantlight, domelight, spherelight)
+6. Set light parameters with modify_node
+7. Configure render settings: setup_render with camera_path and render_engine
+8. Use list_usd_prims to verify the stage hierarchy
+9. Use lop_stage_info for stage overview
+10. Render with render_single_view or start_render
+
+Check composition with get_usd_composition and variants with get_usd_variants."""
+
+
+@mcp.prompt()
+def simulation_setup() -> str:
+    """Guide for setting up Pyro/FLIP/RBD/Vellum simulations."""
+    return """You are helping set up a simulation in Houdini.
+
+Workflow templates (one-call setup):
+- Pyro: setup_pyro_sim(source_path, name)
+- RBD: setup_rbd_sim(source_path, name)
+- FLIP: setup_flip_sim(source_path, name)
+- Vellum: setup_vellum_sim(source_path, sim_type="cloth|hair|grain")
+
+Manual setup:
+1. Create source geometry (SOP level)
+2. Create DOP network: create_node(type="dopnet")
+3. Add appropriate solver nodes
+4. Configure solver parameters with set_parameter/set_parameters
+5. Set simulation frame range with set_frame_range
+6. Run simulation: step_simulation or use the playbar
+
+Monitoring:
+- get_simulation_info — memory usage, object count
+- list_dop_objects — all simulation objects
+- get_dop_field — specific simulation data
+- get_sim_memory_usage — track memory
+
+Cache results:
+- Use write_cache on file cache nodes
+- Check cache with get_cache_status
+- Clear with clear_cache when needed"""
+
+
+@mcp.prompt()
+def pdg_pipeline() -> str:
+    """Guide for building a PDG/TOPs pipeline."""
+    return """You are helping build a PDG (Procedural Dependency Graph) pipeline using TOPs.
+
+Steps:
+1. Create a TOP network: create_node(type="topnet", parent="/obj")
+2. Add TOP nodes for your pipeline stages
+3. Common TOP types: localscheduler, filepattern, ropfetch, pythonprocessor, waitforall
+4. Connect nodes to define dependencies with connect_nodes
+5. Cook the network: pdg_cook(path)
+6. Monitor progress: pdg_status(path)
+7. Check work items: pdg_workitems(path, state="cooked|cooking|waiting|failed")
+8. If needed, dirty and re-cook: pdg_dirty(path) then pdg_cook(path)
+9. Cancel if needed: pdg_cancel(path)
+
+Tips:
+- Use batch operations for efficiency
+- Check errors with find_error_nodes
+- Use pdg_workitems with state filter to find failures"""
+
+
+@mcp.prompt()
+def hda_development() -> str:
+    """Guide for HDA (Houdini Digital Asset) development workflow."""
+    return """You are helping develop an HDA (Houdini Digital Asset).
+
+Creation:
+1. Build your node network in a subnet
+2. Create the HDA: hda_create(node_path, name, label, file_path)
+3. The node becomes an HDA instance
+
+Inspection:
+- hda_list — see all installed HDAs
+- hda_get — detailed info about an HDA type
+- get_hda_sections — list sections (code, help, etc.)
+- get_hda_section_content — read section content
+
+Modification:
+- set_hda_section_content — update section content (help text, scripts)
+- update_hda — sync HDA definition from node changes
+- reload_hda — reload from disk after external changes
+
+Management:
+- hda_install — install from .hda file
+- uninstall_hda — remove from session
+- Use get_node_info on HDA instances to see parameters
+
+Best practices:
+- Name with namespace: company::asset_name::1.0
+- Add help text in the Help section
+- Include OnCreated/OnLoaded scripts as needed
+- Test with create_node after any definition changes"""
+
+
+@mcp.prompt()
+def debug_scene() -> str:
+    """Systematic debugging checklist for Houdini scenes."""
+    return """You are helping debug a Houdini scene. Follow this systematic approach:
+
+1. Scene Overview:
+   - get_scene_info — basic scene info
+   - get_scene_summary — node counts by category
+
+2. Find Errors:
+   - find_error_nodes(root_path="/obj") — cook errors and warnings
+   - Check specific nodes with get_node_info
+
+3. Inspect Problem Nodes:
+   - explain_node(path) — see non-default parms, connections
+   - get_cook_chain(path) — trace dependency chain upstream
+   - get_parameter(node_path, parm_name) — check specific values
+
+4. Check Geometry:
+   - get_geo_summary — point/prim counts, bbox, attribs
+   - get_bounding_box — verify geometry is where expected
+   - get_points/get_prims — inspect actual data
+
+5. Check Connections:
+   - get_network_overview — see all nodes and connections
+   - list_children — verify node hierarchy
+
+6. Performance:
+   - get_sim_memory_usage — simulation memory
+   - list_caches — find cache nodes
+   - get_cache_status — check if caches are loaded
+
+7. Fix Issues:
+   - set_parameter — correct parameter values
+   - revert_parameter — reset to defaults
+   - connect_nodes/disconnect_node_input — fix wiring
+
+8. Verify Fix:
+   - render_single_view — visual verification
+   - find_error_nodes — confirm errors resolved"""
 
 
 def main():
     """Run the MCP server on stdio."""
-    # Check necessary RapidAPI variables are set before running
-    if not RAPIDAPI_HOST_URL or not RAPIDAPI_HOST or not RAPIDAPI_KEY:
-         logger.critical("RAPIDAPI_HOST_URL, RAPIDAPI_HOST, and RAPIDAPI_KEY environment variables are not set. Please configure urls.env.")
-         logger.critical("Server will not start.")
-         sys.exit(1) # Exit if critical configuration is missing
-         
-    logger.info(f"Using RapidAPI Host URL: {RAPIDAPI_HOST_URL}")
-    logger.info(f"Using RapidAPI Host Header: {RAPIDAPI_HOST}")
-    logger.info(f"Langchain available: {LANGCHAIN_AVAILABLE}")
     mcp.run()
 
 if __name__ == "__main__":
