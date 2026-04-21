@@ -9,6 +9,7 @@ and relays each command to the local Houdini plugin on port 9876.
 import sys
 import os
 import site
+from pathlib import Path
 
 # Get the directory where the script is located
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -30,6 +31,18 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, Any, List
 from contextlib import asynccontextmanager
+base_dir = Path(__file__).resolve().parent
+site_packages = base_dir / ".venv" / "Lib" / "site-packages"
+win32_dir = site_packages / "win32"
+win32_lib_dir = site_packages / "win32" / "lib"
+pythonwin_dir = site_packages / "Pythonwin"
+
+for p in [site_packages, win32_dir, win32_lib_dir, pythonwin_dir]:
+    p_str = str(p)
+    if p.exists() and p_str not in sys.path:
+        sys.path.insert(0, p_str)
+
+print("Python path:", sys.path)
 from mcp.server.fastmcp import FastMCP, Context
 import asyncio
 
@@ -531,10 +544,7 @@ def get_houdini_connection() -> HoudiniConnection:
 
 
 # Now define the MCP server that Claude will talk to over stdio
-mcp = FastMCP(
-    "HoudiniMCP",
-    description="A bridging server that connects Claude to Houdini via MCP stdio + TCP, with OPUS API integration."
-)
+mcp = FastMCP("HoudiniMCP")
 
 @asynccontextmanager
 async def server_lifespan(app: FastMCP):
