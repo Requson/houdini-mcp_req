@@ -105,6 +105,18 @@ def install(prefs_dir, source_dir, dry_run=False):
             shutil.copy2(src, dst)
             print(f"  Copied {os.path.basename(filepath)}")
 
+    # Copy scripts/ directory (contains pythonrc.py for Houdini auto-start via HOUDINI_PATH)
+    scripts_src = os.path.join(source_dir, "src", "houdinimcp", "scripts")
+    scripts_dest = os.path.join(plugin_dest, "scripts")
+    if os.path.isdir(scripts_src):
+        if dry_run:
+            print(f"  COPY {scripts_src}/ -> {scripts_dest}/")
+        else:
+            if os.path.exists(scripts_dest):
+                shutil.rmtree(scripts_dest)
+            shutil.copytree(scripts_src, scripts_dest)
+            print(f"  Copied scripts/ (package pythonrc.py)")
+
     # Copy handlers/ directory
     handlers_src = os.path.join(source_dir, HANDLER_DIR)
     handlers_dest = os.path.join(plugin_dest, "handlers")

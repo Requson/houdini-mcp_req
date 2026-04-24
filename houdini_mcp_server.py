@@ -32,6 +32,7 @@ import time as _time
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
+from pathlib import Path
 base_dir = Path(__file__).resolve().parent
 site_packages = base_dir / ".venv" / "Lib" / "site-packages"
 win32_dir = site_packages / "win32"

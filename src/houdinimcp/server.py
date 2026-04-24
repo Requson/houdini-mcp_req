@@ -142,21 +142,60 @@ class HoudiniMCPServer:
 
     def start(self):
         """Begin listening on the given port; sets up a QTimer to poll for data."""
-        self.running = True
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             self.socket.bind((self.host, self.port))
             self.socket.listen(1)
             self.socket.setblocking(False)
+            self.running = True
             self.timer = QtCore.QTimer()
             self.timer.timeout.connect(self._process_server)
             self.timer.start(100)
             print(f"HoudiniMCP server started on {self.host}:{self.port}")
             self.event_collector.start()
+        except OSError as e:
+            if e.errno in (98, 10048):  # EADDRINUSE: Linux=98, Windows=10048
+                self._handle_port_in_use()
+            else:
+                print(f"Failed to start server: {str(e)}")
+                self._cleanup_socket()
         except Exception as e:
             print(f"Failed to start server: {str(e)}")
-            self.stop()
+            self._cleanup_socket()
+
+    def _cleanup_socket(self):
+        if self.socket:
+            try:
+                self.socket.close()
+            except Exception:
+                pass
+        self.socket = None
+        self.running = False
+
+    def _handle_port_in_use(self):
+        """Port is taken — probe to see if it's a live HoudiniMCP server we can adopt."""
+        self._cleanup_socket()
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probe.settimeout(1.0)
+            probe.connect((self.host, self.port))
+            probe.sendall(json.dumps({"type": "ping"}).encode("utf-8"))
+            data = probe.recv(4096)
+            probe.close()
+            result = json.loads(data)
+            if result.get("status") == "success" and result.get("result", {}).get("alive"):
+                print(f"HoudiniMCP: port {self.port} has a live server — already running, skipping start.")
+                self.running = True
+                return
+        except Exception:
+            pass
+        print(
+            f"HoudiniMCP: port {self.port} is held by a stale process.\n"
+            f"  Find the PID:  netstat -ano | findstr :{self.port}\n"
+            f"  Kill it:       taskkill /PID <pid> /F\n"
+            f"  Then call:     hou.session.houdinimcp_server.start()"
+        )
 
     def stop(self):
         """Stop listening; close sockets and timers."""
@@ -166,9 +205,15 @@ class HoudiniMCPServer:
             self.timer.stop()
             self.timer = None
         if self.socket:
-            self.socket.close()
+            try:
+                self.socket.close()
+            except Exception:
+                pass
         if self.client:
-            self.client.close()
+            try:
+                self.client.close()
+            except Exception:
+                pass
         self.socket = None
         self.client = None
         print("HoudiniMCP server stopped")

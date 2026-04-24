@@ -1,3 +1,4 @@
+import atexit
 import os
 import hou
 from .server import HoudiniMCPServer
@@ -7,22 +8,22 @@ def start_server():
         hou.session.houdinimcp_server = HoudiniMCPServer()
         hou.session.houdinimcp_server.start()
     else:
-        print("Houdini MCP Server is already running.")
+        existing = hou.session.houdinimcp_server
+        if not existing.running:
+            existing.start()
+        else:
+            print("Houdini MCP Server is already running.")
 
 def stop_server():
     if hasattr(hou.session, "houdinimcp_server") and hou.session.houdinimcp_server:
         hou.session.houdinimcp_server.stop()
         hou.session.houdinimcp_server = None
-    else:
-        print("Houdini MCP Server is not running.")
 
-# Optionally auto-start
 def initialize_plugin():
-    # Set up default session toggles if desired
     if not hasattr(hou.session, "houdinimcp_use_assetlib"):
         hou.session.houdinimcp_use_assetlib = False
-    # Auto-start server if you want:
     start_server()
+    atexit.register(stop_server)
 
 # Auto-load on import (skipped for headless — managed by headless_server.py)
 if not os.environ.get("HOUDINIMCP_HEADLESS"):
