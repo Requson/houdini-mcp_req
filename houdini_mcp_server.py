@@ -44,7 +44,6 @@ for p in [site_packages, win32_dir, win32_lib_dir, pythonwin_dir]:
     if p.exists() and p_str not in sys.path:
         sys.path.insert(0, p_str)
 
-print("Python path:", sys.path)
 from mcp.server.fastmcp import FastMCP, Context
 import asyncio
 

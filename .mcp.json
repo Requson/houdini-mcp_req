@@ -2,7 +2,7 @@
   "mcpServers": {
     "houdini": {
       "command": "uv",
-      "args": ["run", "python", "houdini_mcp_server.py"]
+      "args": ["--directory", "I:\\workspaces\\houdini-mcp_workspace\\houdini-mcp_req", "run", "python", "houdini_mcp_server.py"]
     }
   }
 }

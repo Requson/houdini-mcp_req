@@ -26,6 +26,7 @@ Hard-won lessons from real production use of the Houdini MCP. Organized by conte
   - [Standalone husk: VEX Shaders Need opdef: URIs](#standalone-husk-vex-shaders-need-opdef-uris)
   - [editmaterialproperties: parm.unexpandedString() Aborts Mid-Node on Non-String Spare Parms](#editmaterialproperties-parmunexpandedstring-aborts-mid-node-on-non-string-spare-parms)
 - [SOPs / File Cache](#sops--file-cache)
+  - [Use Null SOPs as Stable Reference Points for Channel References](#use-null-sops-as-stable-reference-points-for-channel-references)
   - [parm.set() Silently Ignored When Expression Active](#parmset-silently-ignored-when-expression-active)
   - [hbatch render Only Works with ROPs, Not SOPs](#hbatch-render-only-works-with-rops-not-sops)
 - [General MCP Usage](#general-mcp-usage)
@@ -370,6 +371,46 @@ for p in node.parms():
 ---
 
 ## SOPs / File Cache
+
+### HScript Channel Expressions: Use `if()` Not Ternary `?:`
+
+> Houdini 21.0.631
+
+**Houdini's HScript expression language does not support the C-style ternary `? :` operator.** Writing `condition ? true_val : false_val` silently evaluates to just `condition` (a 0 or 1), discarding the branches entirely. No error is raised.
+
+**Anti-pattern:** `ch("../../do_flutes") ? ch("../../flutes") * ch("../../flute_res") : ch("../../column_res_circ")` → evaluates to `1` (the value of `do_flutes`), ignoring the rest.
+
+**Fix:** Use the `if()` function:
+```
+if(ch("../../do_flutes"), ch("../../flutes") * ch("../../flute_res"), ch("../../column_res_circ"))
+```
+
+**Note:** This applies to all channel expression fields (parm boxes, spare parms, etc.) when using the default HScript language. Python expressions (`setExpression(..., language=hou.exprLanguage.Python)`) do support the standard Python ternary `x if cond else y`.
+
+### Use Null SOPs as Stable Reference Points for Channel References
+
+> Houdini 21.0.631
+
+**Never reference a node's parameter or output directly by node name in a channel expression or `detail()` call if that node might be renamed, replaced, or moved.** Node names are implementation details — they break all downstream references silently when changed.
+
+**Anti-pattern:** `detail("../my_attribwrangle", "col_height", 0)` or `ch("../my_wrangle/parm")` — breaks the moment `my_attribwrangle` is renamed.
+
+**Pattern:** Route data through a `null` SOP with a stable, meaningful name and reference that instead.
+
+For geometry/attrib data — wire the upstream node into a named null, then reference by input index:
+```vex
+// IN_Circumference null wired as input 1 — name never needs to change
+float h = detail(1, "col_height", 0);
+```
+
+For parameter channel references — promote or relay through a null, then reference the null:
+```
+ch("../../CTRL/col_height")   // CTRL null is the stable interface
+```
+
+**Why:** The null is the named "API surface." If the implementation behind it changes (rename, replace, restructure), you update one wire, not every downstream expression. Nulls have zero cook cost.
+
+**Also applies to `object_merge` path strings** — point them at a named null (`IN_Circumference`, `IN_Data`) rather than directly at the source wrangle path.
 
 ### `parm.set()` Silently Ignored When Expression Active
 
