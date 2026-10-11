@@ -21,6 +21,7 @@ for venv_site_packages in _venv_candidates:
         sys.path.insert(0, venv_site_packages)
         break
 import json
+import select
 import socket
 import subprocess
 import logging
@@ -75,7 +76,10 @@ class HoudiniConnection:
     def connect(self) -> bool:
         """Connect to the Houdini plugin (which is listening on self.host:self.port)."""
         if self.sock is not None:
-            return True  # Already connected
+            if not self._is_stale():
+                return True
+            logger.info("Cached Houdini socket is closed (Houdini restarted?); reconnecting.")
+            self.disconnect()
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.host, self.port))
@@ -87,6 +91,12 @@ class HoudiniConnection:
             self.sock = None
             self.connected_since = None
             return False
+
+    def _is_stale(self) -> bool:
+        # The plugin never sends unsolicited data, so a socket that is readable
+        # before we send means the peer closed it (EOF/RST).
+        readable, _, _ = select.select([self.sock], [], [], 0)
+        return bool(readable)
 
     def disconnect(self):
         """Close socket if open."""

@@ -41,7 +41,7 @@ def _load_houdini_connection_class():
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     if alias.name.split(".")[0] in (
-                        "json", "socket", "logging", "asyncio"
+                        "json", "select", "socket", "logging", "asyncio"
                     ):
                         nodes_to_compile.append(node)
                         break
@@ -94,6 +94,18 @@ class TestHoudiniConnection:
         result = conn.send_command("nonexistent_command")
         assert result["status"] == "success"
         assert result["result"]["echo"] == "nonexistent_command"
+        conn.disconnect()
+
+    def test_reconnects_when_peer_closed_cached_socket(self, mock_houdini_server):
+        """A Houdini restart leaves the cached socket dead; the next command must
+        reconnect instead of failing. The mock closes the client after each reply."""
+        conn = _make_connection(mock_houdini_server.port)
+        assert conn.send_command("first")["status"] == "success"
+        import time
+        time.sleep(0.1)  # let the peer's close reach our socket
+        result = conn.send_command("second")
+        assert result["status"] == "success"
+        assert result["result"]["echo"] == "second"
         conn.disconnect()
 
     def test_connection_error_returns_error_dict(self):
