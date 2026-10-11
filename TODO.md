@@ -6,32 +6,6 @@ Format: one short entry per item. Symptom, reproduction, suspected location, wor
 
 ---
 
-## MCP bridge bugs
-
-### `create_cop_node` rejects `node_type="null"`
-
-> Discovered 2026-05-23, Houdini 21.0.631
-
-**Symptom:** Calling `create_cop_node(parent_path=..., node_type="null", name="OUT_Foo")` fails with:
-
-```
-pydantic.ValidationError: 1 validation error for create_cop_nodeArguments
-node_type
-  Input should be a valid string [type=string_type, input_value=None, input_type=NoneType]
-```
-
-The literal string `"null"` is being coerced to JSON `null` somewhere between the MCP client and the pydantic-validated handler signature. Pydantic then sees `None` and rejects it as not a string.
-
-**Reproduction:** Any attempt to create a `null` COP via `create_cop_node`. Other COP types (`maskfromcurves`, `wrangle`, `monotosdf`, etc.) work fine.
-
-**Suspected location:** `houdini_mcp_server.py` — the `create_cop_node` tool wrapper, or upstream JSON parsing in the MCP transport. Likely the schema declares `node_type` as `str` without explicitly allowing the string literal `"null"`, and the JSON decoder helpfully turns it into Python `None` before pydantic ever sees it.
-
-**Workaround:** Use `execute_houdini_code` with `parent.createNode('null', name)`.
-
-**Fix sketch:** Either (a) quote the value harder before transport, (b) accept `node_type: str | None` and coerce `None` back to `"null"` in the handler, or (c) JSON-encode the value as `{"node_type": "null"}` and validate post-decode. Reproduce with a unit test that passes `"null"` and other literal-like strings (`"true"`, `"false"`).
-
-
----
 
 ## Plugin bugs
 

@@ -425,6 +425,12 @@ async def server_lifespan(app: FastMCP):
 mcp.lifespan = server_lifespan
 
 
+def _node_type(node_type: Optional[str]) -> str:
+    # MCP clients can decode a bare `null` argument as JSON null, so a request
+    # for the Null node type arrives as None.
+    return "null" if node_type is None else node_type
+
+
 def _send_tool_command(cmd_type: str, params: Dict[str, Any] = None) -> str:
     """Send a command to Houdini and return the JSON result string."""
     conn = get_houdini_connection()
@@ -471,11 +477,11 @@ def get_scene_info(ctx: Context) -> str:
     return _send_tool_command("get_scene_info")
 
 @mcp.tool()
-def create_node(ctx: Context, node_type: str, parent_path: str = "/obj", name: str = None) -> str:
+def create_node(ctx: Context, node_type: Optional[str], parent_path: str = "/obj", name: str = None) -> str:
     """
     Create a new node in Houdini.
     """
-    params = {"node_type": node_type, "parent_path": parent_path}
+    params = {"node_type": _node_type(node_type), "parent_path": parent_path}
     if name:
         params["name"] = name
     return _send_tool_command("create_node", params)
@@ -1356,10 +1362,10 @@ def get_cop_layer(ctx: Context, path: str, plane_name: str = "C") -> str:
     return _send_tool_command("get_cop_layer", {"path": path, "plane_name": plane_name})
 
 @mcp.tool()
-def create_cop_node(ctx: Context, parent_path: str, node_type: str,
+def create_cop_node(ctx: Context, parent_path: str, node_type: Optional[str],
                     name: str = None) -> str:
     """Create a COP node."""
-    params = {"parent_path": parent_path, "node_type": node_type}
+    params = {"parent_path": parent_path, "node_type": _node_type(node_type)}
     if name is not None:
         params["name"] = name
     return _send_tool_command("create_cop_node", params)
@@ -1403,10 +1409,10 @@ def get_chop_data(ctx: Context, path: str, channel: str = None,
     return _send_tool_command("get_chop_data", params)
 
 @mcp.tool()
-def create_chop_node(ctx: Context, parent_path: str, node_type: str,
+def create_chop_node(ctx: Context, parent_path: str, node_type: Optional[str],
                      name: str = None) -> str:
     """Create a CHOP node."""
-    params = {"parent_path": parent_path, "node_type": node_type}
+    params = {"parent_path": parent_path, "node_type": _node_type(node_type)}
     if name is not None:
         params["name"] = name
     return _send_tool_command("create_chop_node", params)
@@ -1510,10 +1516,10 @@ def get_last_modified_prims(ctx: Context, path: str, count: int = 10) -> str:
     return _send_tool_command("get_last_modified_prims", {"path": path, "count": count})
 
 @mcp.tool()
-def create_lop_node(ctx: Context, parent_path: str, node_type: str,
+def create_lop_node(ctx: Context, parent_path: str, node_type: Optional[str],
                     name: str = None) -> str:
     """Create a LOP node."""
-    params = {"parent_path": parent_path, "node_type": node_type}
+    params = {"parent_path": parent_path, "node_type": _node_type(node_type)}
     if name is not None:
         params["name"] = name
     return _send_tool_command("create_lop_node", params)
