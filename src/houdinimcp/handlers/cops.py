@@ -2,11 +2,40 @@
 import hou
 
 
+def _is_copernicus(node):
+    return node.type().category().name() == "Cop"
+
+
+def _layer_info(layer):
+    return {
+        "resolution": list(layer.bufferResolution()),
+        "channels": layer.channelCount(),
+        "storage": layer.storageType().name(),
+    }
+
+
+def _copernicus_outputs(node):
+    outputs = []
+    for i, (label, data_type) in enumerate(zip(node.outputLabels(), node.outputDataTypes())):
+        entry = {"index": i, "label": label, "type": data_type}
+        layer = node.layer(i)
+        if layer:
+            entry.update(_layer_info(layer))
+        outputs.append(entry)
+    return outputs
+
+
 def get_cop_info(path):
     """Get info about a COP node: resolution, planes, depth."""
     node = hou.node(path)
     if not node:
         raise ValueError(f"Node not found: {path}")
+    if _is_copernicus(node):
+        return {
+            "path": node.path(),
+            "type": node.type().name(),
+            "outputs": _copernicus_outputs(node),
+        }
     cop = node
     planes = []
     for plane in cop.planes():
@@ -40,6 +69,14 @@ def get_cop_layer(path, plane_name="C"):
     node = hou.node(path)
     if not node:
         raise ValueError(f"Node not found: {path}")
+    if _is_copernicus(node):
+        labels = node.outputLabels()
+        if plane_name not in labels:
+            raise ValueError(f"Output not found: {plane_name} (outputs: {', '.join(labels)})")
+        layer = node.layer(labels.index(plane_name))
+        if not layer:
+            raise ValueError(f"Output {plane_name} on {path} has no image layer")
+        return {"path": path, "plane": plane_name, **_layer_info(layer)}
     planes = node.planes()
     if plane_name not in planes:
         raise ValueError(f"Plane not found: {plane_name}")

@@ -5,6 +5,10 @@ import threading
 
 import pytest
 
+# Installs the hou/PySide mocks before the handler test modules import; without
+# it they collect first (alphabetically) and skip themselves.
+from tests import test_server_commands  # noqa: F401
+
 
 class MockHoudiniServer:
     """Minimal TCP server that mimics Houdini's command protocol.

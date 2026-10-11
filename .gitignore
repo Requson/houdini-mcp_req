@@ -37,3 +37,4 @@ research/
 
 # Session scratch (disposable staging; promote out if it becomes evidence)
 tmp/
+src/houdinimcp/mcp.json

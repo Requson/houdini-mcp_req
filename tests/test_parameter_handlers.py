@@ -45,7 +45,7 @@ class MockParm:
     def name(self):
         return self._name
 
-    def label(self):
+    def description(self):
         return self._label
 
     def eval(self):
@@ -76,7 +76,7 @@ class MockParm:
     def expression(self):
         if self._expression:
             return self._expression
-        raise type(sys.modules["hou"]).OperationFailed("No expression")
+        raise sys.modules["hou"].OperationFailed("No expression")
 
     def expressionLanguage(self):
         return "Hscript"

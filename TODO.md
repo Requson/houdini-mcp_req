@@ -30,27 +30,6 @@ The literal string `"null"` is being coerced to JSON `null` somewhere between th
 
 **Fix sketch:** Either (a) quote the value harder before transport, (b) accept `node_type: str | None` and coerce `None` back to `"null"` in the handler, or (c) JSON-encode the value as `{"node_type": "null"}` and validate post-decode. Reproduce with a unit test that passes `"null"` and other literal-like strings (`"true"`, `"false"`).
 
-### Copernicus COP inspection tools crash
-
-> Discovered 2026-05-23, Houdini 21.0.631
-
-> Status 2026-10-11: `get_node_info` fixed upstream (40dc6e8, `.rgb()` / `.description()`). Still open: `parm.label()` in `handlers/context.py` (`explain_node`) and `handlers/parameters.py`; `planes()` in `handlers/cops.py`.
-
-Three inspection tools fail on Copernicus (`Cop` category) nodes:
-
-| Tool | Error |
-|---|---|
-| `get_node_info` | `'Color' object is not iterable` |
-| `explain_node` | `'Parm' object has no attribute 'label'` |
-| `get_cop_info` | `'CopNode' object has no attribute 'planes'` |
-
-All three error before returning data, so the tools are unusable for any node inside a `copnet`. SOP/LOP/DOP nodes are unaffected.
-
-**Suspected location:** handler code in `src/houdinimcp/handlers/nodes.py` (for `get_node_info`, `explain_node`) and a COP-specific handler for `get_cop_info`. The handlers were written against COP2 / general node APIs that don't match Copernicus's API surface (Copernicus uses `node.layer(output_index)` and image-layer abstractions instead of `node.planes`).
-
-**Workaround:** Use `execute_houdini_code` to manually iterate `node.parms()`, `node.inputs()`, `node.outputs()`. For COP layer data: `node.layer(output_index)` + `layer.bufferResolution()` / `layer.channelCount()` / `layer.allBufferElements(hou.imageLayerStorageType.Float32, channels)`.
-
-**Fix sketch:** Detect Copernicus nodes (`node.type().category().name() == "Cop"`) at the top of each handler and branch to a Copernicus-aware code path. Also fix the `'Color'` iteration bug — `node.color()` returns a single `hou.Color`, not a tuple; the handler is probably trying to unpack it.
 
 ---
 

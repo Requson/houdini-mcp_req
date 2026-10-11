@@ -120,46 +120,52 @@ def install(prefs_dir, source_dir, dry_run=False):
     print(f"Package config:    {os.path.join(packages_dir, f'{PACKAGE_NAME}.json')}")
     print()
 
-    # Copy plugin files
-    if not dry_run:
-        os.makedirs(plugin_dest, exist_ok=True)
+    # A dev setup symlinks plugin_dest to this repo's package; copying (and the
+    # rmtree of scripts/ and handlers/) would then hit the source files themselves.
+    linked = os.path.realpath(plugin_dest) == os.path.realpath(os.path.join(source_dir, "src", PACKAGE_NAME))
+    if linked:
+        print(f"  LINKED {plugin_dest} -> repo source; skipping plugin file copy")
+    else:
+        # Copy plugin files
+        if not dry_run:
+            os.makedirs(plugin_dest, exist_ok=True)
 
-    for filepath in PLUGIN_FILES:
-        src = os.path.join(source_dir, filepath)
-        dst = os.path.join(plugin_dest, os.path.basename(filepath))
-        if not os.path.isfile(src):
-            print(f"  SKIP {filepath} (not found in source)")
-            continue
-        if dry_run:
-            print(f"  COPY {src} -> {dst}")
-        else:
-            shutil.copy2(src, dst)
-            print(f"  Copied {os.path.basename(filepath)}")
+        for filepath in PLUGIN_FILES:
+            src = os.path.join(source_dir, filepath)
+            dst = os.path.join(plugin_dest, os.path.basename(filepath))
+            if not os.path.isfile(src):
+                print(f"  SKIP {filepath} (not found in source)")
+                continue
+            if dry_run:
+                print(f"  COPY {src} -> {dst}")
+            else:
+                shutil.copy2(src, dst)
+                print(f"  Copied {os.path.basename(filepath)}")
 
-    # Copy scripts/ directory (contains pythonrc.py for Houdini auto-start via HOUDINI_PATH)
-    scripts_src = os.path.join(source_dir, "src", "houdinimcp", "scripts")
-    scripts_dest = os.path.join(plugin_dest, "scripts")
-    if os.path.isdir(scripts_src):
-        if dry_run:
-            print(f"  COPY {scripts_src}/ -> {scripts_dest}/")
-        else:
-            if os.path.exists(scripts_dest):
-                shutil.rmtree(scripts_dest)
-            shutil.copytree(scripts_src, scripts_dest)
-            print(f"  Copied scripts/ (package pythonrc.py)")
+        # Copy scripts/ directory (contains pythonrc.py for Houdini auto-start via HOUDINI_PATH)
+        scripts_src = os.path.join(source_dir, "src", "houdinimcp", "scripts")
+        scripts_dest = os.path.join(plugin_dest, "scripts")
+        if os.path.isdir(scripts_src):
+            if dry_run:
+                print(f"  COPY {scripts_src}/ -> {scripts_dest}/")
+            else:
+                if os.path.exists(scripts_dest):
+                    shutil.rmtree(scripts_dest)
+                shutil.copytree(scripts_src, scripts_dest)
+                print(f"  Copied scripts/ (package pythonrc.py)")
 
-    # Copy handlers/ directory
-    handlers_src = os.path.join(source_dir, HANDLER_DIR)
-    handlers_dest = os.path.join(plugin_dest, "handlers")
-    if os.path.isdir(handlers_src):
-        if dry_run:
-            print(f"  COPY {handlers_src}/ -> {handlers_dest}/")
-        else:
-            if os.path.exists(handlers_dest):
-                shutil.rmtree(handlers_dest)
-            shutil.copytree(handlers_src, handlers_dest)
-            handler_count = sum(1 for f in os.listdir(handlers_dest) if f.endswith('.py'))
-            print(f"  Copied handlers/ ({handler_count} modules)")
+        # Copy handlers/ directory
+        handlers_src = os.path.join(source_dir, HANDLER_DIR)
+        handlers_dest = os.path.join(plugin_dest, "handlers")
+        if os.path.isdir(handlers_src):
+            if dry_run:
+                print(f"  COPY {handlers_src}/ -> {handlers_dest}/")
+            else:
+                if os.path.exists(handlers_dest):
+                    shutil.rmtree(handlers_dest)
+                shutil.copytree(handlers_src, handlers_dest)
+                handler_count = sum(1 for f in os.listdir(handlers_dest) if f.endswith('.py'))
+                print(f"  Copied handlers/ ({handler_count} modules)")
 
     # Copy .pypanel files to Houdini's python_panels directory
     panels_dest = os.path.join(prefs_dir, "python_panels")

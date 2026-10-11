@@ -13,32 +13,31 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 def _setup_hou_animation():
     hou = sys.modules["hou"]
-    if not hasattr(hou, "Keyframe"):
-        class MockKeyframe:
-            def __init__(self):
-                self._frame = 0
-                self._value = 0
-                self._expr = None
+    class MockKeyframe:
+        def __init__(self):
+            self._frame = 0
+            self._value = 0
+            self._expr = None
 
-            def setFrame(self, f):
-                self._frame = f
+        def setFrame(self, f):
+            self._frame = f
 
-            def setValue(self, v):
-                self._value = v
+        def setValue(self, v):
+            self._value = v
 
-            def frame(self):
-                return self._frame
+        def frame(self):
+            return self._frame
 
-            def value(self):
-                return self._value
+        def value(self):
+            return self._value
 
-            def expression(self):
-                return self._expr
+        def expression(self):
+            return self._expr
 
-            def isExpressionSet(self):
-                return self._expr is not None
+        def isExpressionSet(self):
+            return self._expr is not None
 
-        hou.Keyframe = MockKeyframe
+    hou.Keyframe = MockKeyframe
     if not hasattr(hou, "time"):
         hou.time = lambda: 0.0
     if not hasattr(hou, "intFrame"):
