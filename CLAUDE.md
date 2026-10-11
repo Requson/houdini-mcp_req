@@ -57,6 +57,9 @@ scripts/
     launch.py                  # Launch Houdini and/or MCP bridge
     headless_server.py         # Run MCP TCP server inside hython (no GUI)
     fetch_houdini_docs.py      # Download Houdini docs corpus and build BM25 index
+    fetch_redshift_docs.py     # Redshift manual from Maxon offline help ZIP → separate BM25 index
+    fetch_arnold_docs.py       # Arnold core + HtoA guides from help.autodesk.com → separate BM25 index
+    html_to_markdown.py        # Shared vendor-help HTML → markdown converter (stdlib)
     hip_parser.py              # Cpio-based .hip file parser (stdlib only)
     hip_patterns.py            # Pattern extraction from parsed .hip data
 tests/                         # pytest test suite (69 tests)
@@ -105,8 +108,9 @@ No Houdini? Bridge auto-launches: hython → headless_server.py → server.py �
 - Runs in a **separate** Python process (via `uv run`).
 - `HoudiniConnection` dataclass manages a persistent TCP connection (global singleton).
 - `_send_tool_command()` helper reduces each MCP tool to ~3 lines.
-- `search_docs` and `get_doc` tools run locally via `houdini_rag.py` — no Houdini connection needed.
+- `search_docs` and `get_doc` tools run locally via `houdini_rag.py` — no Houdini connection needed. `source` selects `houdini` (docs + hip patterns), `redshift` or `arnold`; each renderer manual has its own gitignored index (`RENDERER_DOCS` in `houdini_rag.py`).
 - **Headless auto-launch**: if no Houdini is listening, `find_hython()` locates the binary and `_launch_headless_houdini()` spawns `scripts/headless_server.py` in a managed subprocess. Cleaned up on shutdown via lifespan + atexit. Disable with `HOUDINIMCP_NO_HEADLESS=1`.
+- **GUI launch is the LLM's job, not the server's**: the server only ever auto-launches *headless* hython. GUI-only work (viewport, flipbooks, GPU-only Copernicus/COPs) needs a real GUI session. When the user asks for it, the assistant launches the `houdini`/`houdinifx` binary from the shell itself (see instructions rule 5a in `houdini_mcp_server.py`) — it does not ask the user to open it. It does not open the GUI unprompted.
 
 ### Layer 3: Rendering (`src/houdinimcp/HoudiniMCPRender.py`)
 - Utility module imported by `handlers/rendering.py` (runs inside Houdini).
@@ -151,7 +155,9 @@ See **[CLAUDE_GENERIC.md](CLAUDE_GENERIC.md)** — reusable coding guidelines (t
 
 ## Contributing to Best Practices
 
-When you discover a **non-trivial** Houdini behavior while working through this MCP — silent failures, undocumented API quirks, metadata requirements, required parameter ordering, etc. — add it to [`BEST_PRACTICES.md`](BEST_PRACTICES.md).
+Best practices are **two layers**: [`BEST_PRACTICES.md`](BEST_PRACTICES.md) is the always-read entry — the "build nodes, not code" authoring philosophy, the cross-cutting LLM pitfalls (A–H), and a routing table — and [`best_practices/<area>.md`](best_practices/) holds the involved, context-specific gotchas (`dops`, `cops`, `cop2`, `sops`, `lops_usd`, `rops_render`, `karma`, `mcp_and_environment`, `hda`, `chops`, `viewport`, `kinefx_apex`, `houdini_engine`, plus a `pdg` stub). UE-side Houdini Engine gotchas live in `I:/workspaces/unreal-mcp/BEST_PRACTICES.md`.
+
+When you discover a **non-trivial** Houdini behavior while working through this MCP — silent failures, undocumented API quirks, metadata requirements, required parameter ordering, etc. — record it.
 
 **What qualifies as non-trivial:**
 - Behavior that has no error message (silent failure)
@@ -159,13 +165,15 @@ When you discover a **non-trivial** Houdini behavior while working through this 
 - Workarounds for missing Houdini features (e.g., no timeshift in Copernicus)
 - Anything that took multiple attempts to diagnose
 
+**Where it goes (the placement gate):**
+- **Generalizable + usable on a first pass + condenses to ~100–200 tokens → `BEST_PRACTICES.md` (Layer 1).** A one-line echo here is worth keeping even when the detail lives in an area file — repetition primes the next agent.
+- **Involved or narrow to one context → strictly `best_practices/<area>.md` (Layer 2).** Create the area file if it doesn't exist; add a one-line pointer from Layer 1 only if it also passes the gate above.
+
 **How to add it:**
-1. **Read `BEST_PRACTICES.md` first** — check that the item isn't already covered
-2. Place it under the appropriate context section (COPs, SOPs, LOPs, TOPs, etc.)
-3. Create the section if it doesn't exist yet
-4. Add an entry to the Index at the top of the file
-5. **Include the Houdini version** (e.g., `> Houdini 21.0.631`) — behaviors change between releases
-6. **Use anti-pattern format** when applicable: "Tried X, it silently failed, do Y instead"
-7. Be brief: problem, symptom, fix. A few sentences, not paragraphs. Code snippets only when the syntax is the non-obvious part
+1. **Read the target file first** — check the item isn't already covered
+2. Place it in the area file that matches the context; create it if missing
+3. **Include the Houdini version** (e.g., `> Houdini 21.0.631`) — behaviors change between releases
+4. **Use anti-pattern format** when applicable: "Tried X, it silently failed, do Y instead"
+5. Be brief: problem, symptom, fix. A few sentences, not paragraphs. Code snippets only when the syntax is the non-obvious part
 
 Do **not** add trivial items (standard API usage, well-documented behavior, one-off bugs).

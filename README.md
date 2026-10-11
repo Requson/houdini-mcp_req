@@ -149,6 +149,20 @@ python scripts/fetch_houdini_docs.py
 
 This enables the `search_docs` and `get_doc` tools — they work offline without a Houdini connection.
 
+Optional: index the Redshift for Houdini manual as a separate source (`source="redshift"`).
+The script downloads Maxon's official offline help ZIP (~2.7 GB) and keeps only the text:
+
+```bash
+python scripts/fetch_redshift_docs.py              # or: --zip PATH to use a ZIP on disk
+```
+
+Optional: index the Arnold core and HtoA user guides (`source="arnold"`). Autodesk offers no
+offline copy, so the script fetches each page politely (~2 hours; a rerun resumes):
+
+```bash
+python scripts/fetch_arnold_docs.py
+```
+
 </details>
 
 ## What You Get
@@ -421,8 +435,8 @@ No Houdini running? Bridge auto-launches hython → headless_server.py → serve
 ### Documentation Search (2)
 | Tool | Description |
 |------|-------------|
-| `search_docs` | BM25 search across 30,000+ documents (no Houdini needed) |
-| `get_doc` | Read full content of a doc page |
+| `search_docs` | BM25 search across 30,000+ documents (no Houdini needed); `source` picks Houdini docs, the Redshift manual, or the Arnold guides |
+| `get_doc` | Read full content of a doc page from any `source` |
 
 </details>
 

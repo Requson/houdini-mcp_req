@@ -4,6 +4,8 @@ import json
 import socket
 import traceback
 import os
+import time as _time
+import tempfile
 try:
     from PySide6 import QtCore
 except ImportError:
@@ -87,12 +89,83 @@ from .handlers.rendering import (
     create_render_node, start_render, get_render_progress,
 )
 from .event_collector import EventCollector
+from .render_lock import gpu_render_lock, GPUBusyError
 
 EXTENSION_NAME = "Houdini MCP"
 EXTENSION_VERSION = (0, 2)
 EXTENSION_DESCRIPTION = "Connect Houdini to Claude via MCP"
 
-DEFAULT_PORT = int(os.environ.get("HOUDINIMCP_PORT", 9876))
+# One GPU per machine caps how many Houdini instances are useful at once, so the
+# port range is a soft ceiling: one instance per port. Both bounds are overridable
+# for hosts with different hardware (HOUDINIMCP_BASE_PORT, HOUDINIMCP_MAX_INSTANCES).
+MIN_PORT = int(os.environ.get("HOUDINIMCP_BASE_PORT", 9876))
+MAX_PORT = MIN_PORT + int(os.environ.get("HOUDINIMCP_MAX_INSTANCES", 8)) - 1
+
+
+def _resolve_port():
+    port = int(os.environ.get("HOUDINIMCP_PORT", MIN_PORT))
+    if not MIN_PORT <= port <= MAX_PORT:
+        raise ValueError(
+            "HOUDINIMCP_PORT %d out of range %d-%d (raise HOUDINIMCP_MAX_INSTANCES to allow more)."
+            % (port, MIN_PORT, MAX_PORT)
+        )
+    return port
+
+
+DEFAULT_PORT = _resolve_port()
+
+
+# ---- GUI/headless port handoff ------------------------------------------------
+# Only one process can listen on the port. A GUI (interactive) session always
+# wins: it writes a short-lived claim file, a headless server sees the claim and
+# steps down to free the port, and the GUI then binds. This lets the bridge and
+# an artist share one port without manual juggling.
+_CLAIM_TTL = 15.0  # seconds a port claim stays valid
+
+
+def _claim_path(port):
+    return os.path.join(tempfile.gettempdir(), "houdinimcp_claim_%d" % port)
+
+
+def _write_claim(port):
+    try:
+        with open(_claim_path(port), "w") as f:
+            f.write("%d %f" % (os.getpid(), _time.time()))
+    except Exception:
+        pass
+
+
+def _clear_claim(port):
+    try:
+        os.remove(_claim_path(port))
+    except OSError:
+        pass
+
+
+def _read_claim(port):
+    try:
+        with open(_claim_path(port)) as f:
+            pid_s, ts_s = f.read().split()
+        return int(pid_s), float(ts_s)
+    except Exception:
+        return None
+
+
+def _gui_claim_pending(port):
+    """True if another process has a fresh claim on the port."""
+    c = _read_claim(port)
+    if not c:
+        return False
+    pid, ts = c
+    if pid == os.getpid():
+        return False
+    return (_time.time() - ts) < _CLAIM_TTL
+
+
+def _clean_stale_claim(port):
+    c = _read_claim(port)
+    if c and (_time.time() - c[1]) >= _CLAIM_TTL:
+        _clear_claim(port)
 
 
 class HoudiniMCPServer:
@@ -126,6 +199,12 @@ class HoudiniMCPServer:
         "create_material_workflow", "assign_material_workflow", "build_sop_chain", "setup_render",
     }
 
+    # GPU render commands are serialized machine-wide (one GPU, many instances).
+    RENDER_COMMANDS = {
+        "render_single_view", "render_quad_view", "render_specific_camera",
+        "render_flipbook", "start_render",
+    }
+
     # Re-export for tests that reference it on the class
     DANGEROUS_PATTERNS = DANGEROUS_PATTERNS
 
@@ -139,63 +218,60 @@ class HoudiniMCPServer:
         self.buffer = b''
         self.timer = None
         self.event_collector = EventCollector()
-
-    def start(self):
-        """Begin listening on the given port; sets up a QTimer to poll for data."""
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Interactive sessions win the port; headless sessions yield it.
         try:
-            self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
-            self.socket.setblocking(False)
-            self.running = True
-            self.timer = QtCore.QTimer()
-            self.timer.timeout.connect(self._process_server)
-            self.timer.start(100)
-            print(f"HoudiniMCP server started on {self.host}:{self.port}")
-            self.event_collector.start()
-        except OSError as e:
-            if e.errno in (98, 10048):  # EADDRINUSE: Linux=98, Windows=10048
-                self._handle_port_in_use()
-            else:
-                print(f"Failed to start server: {str(e)}")
-                self._cleanup_socket()
-        except Exception as e:
-            print(f"Failed to start server: {str(e)}")
-            self._cleanup_socket()
+            self.is_ui = bool(hou.isUIAvailable())
+        except Exception:
+            self.is_ui = False
 
-    def _cleanup_socket(self):
-        if self.socket:
+    def _bind_and_serve(self):
+        """Try to bind the port and start the poll timer. Returns True on success."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((self.host, self.port))
+            s.listen(1)
+            s.setblocking(False)
+        except Exception:
             try:
-                self.socket.close()
+                s.close()
             except Exception:
                 pass
-        self.socket = None
-        self.running = False
+            return False
+        self.socket = s
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self._process_server)
+        self.timer.start(100)
+        print(f"HoudiniMCP server started on {self.host}:{self.port} "
+              f"({'GUI' if self.is_ui else 'headless'})")
+        self.event_collector.start()
+        return True
 
-    def _handle_port_in_use(self):
-        """Port is taken — probe to see if it's a live HoudiniMCP server we can adopt."""
-        self._cleanup_socket()
-        try:
-            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            probe.settimeout(1.0)
-            probe.connect((self.host, self.port))
-            probe.sendall(json.dumps({"type": "ping"}).encode("utf-8"))
-            data = probe.recv(4096)
-            probe.close()
-            result = json.loads(data)
-            if result.get("status") == "success" and result.get("result", {}).get("alive"):
-                print(f"HoudiniMCP: port {self.port} has a live server — already running, skipping start.")
-                self.running = True
-                return
-        except Exception:
-            pass
-        print(
-            f"HoudiniMCP: port {self.port} is held by a stale process.\n"
-            f"  Find the PID:  netstat -ano | findstr :{self.port}\n"
-            f"  Kill it:       taskkill /PID <pid> /F\n"
-            f"  Then call:     hou.session.houdinimcp_server.start()"
-        )
+    def start(self):
+        """Begin listening. A GUI session claims the port from a headless one if busy."""
+        self.running = True
+        _clean_stale_claim(self.port)
+        if self._bind_and_serve():
+            return
+        # Port is busy.
+        if self.is_ui:
+            # Claim the port; a headless holder will step down, then we bind.
+            _write_claim(self.port)
+            for _ in range(20):  # up to ~10s
+                _time.sleep(0.5)
+                if self._bind_and_serve():
+                    _clear_claim(self.port)
+                    print("HoudiniMCP: GUI session took the port from a headless instance.")
+                    return
+            _clear_claim(self.port)
+            print(
+                f"HoudiniMCP: port {self.port} held by another GUI session or a stale process; not starting.\n"
+                f"  Find the PID:  netstat -ano | findstr :{self.port}   (Linux: ss -ltnp | grep {self.port})\n"
+                f"  Kill it, then: hou.session.houdinimcp_server.start()"
+            )
+        else:
+            print(f"HoudiniMCP: port {self.port} already in use; headless server not started.")
+        self.running = False
 
     def stop(self):
         """Stop listening; close sockets and timers."""
@@ -221,6 +297,14 @@ class HoudiniMCPServer:
     def _process_server(self):
         """Timer callback to accept connections and process incoming data."""
         if not self.running:
+            return
+        # A headless server yields the port when a GUI session claims it.
+        if not self.is_ui and _gui_claim_pending(self.port):
+            print("HoudiniMCP: GUI session requested the port; headless stepping down.")
+            self.stop()
+            app = QtCore.QCoreApplication.instance()
+            if app is not None:
+                app.quit()  # let the managed hython process exit cleanly
             return
         try:
             if not self.client and self.socket:
@@ -263,15 +347,23 @@ class HoudiniMCPServer:
         """Entry point for executing a JSON command from the client."""
         try:
             cmd_type = command.get("type", "")
-            if cmd_type in self.MUTATING_COMMANDS:
-                with hou.undos.group(f"MCP: {cmd_type}"):
-                    return self._execute_command_internal(command)
-            else:
-                return self._execute_command_internal(command)
+            if cmd_type in self.RENDER_COMMANDS:
+                with gpu_render_lock():
+                    return self._dispatch_command(cmd_type, command)
+            return self._dispatch_command(cmd_type, command)
+        except GPUBusyError as e:
+            return {"status": "gpu_busy", "message": str(e)}
         except Exception as e:
             print(f"Error executing command: {str(e)}")
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
+
+    def _dispatch_command(self, cmd_type, command):
+        """Dispatch a command, wrapping mutating ones in an undo group."""
+        if cmd_type in self.MUTATING_COMMANDS:
+            with hou.undos.group(f"MCP: {cmd_type}"):
+                return self._execute_command_internal(command)
+        return self._execute_command_internal(command)
 
     def _get_handlers(self):
         """Return the command handler dispatch dict."""

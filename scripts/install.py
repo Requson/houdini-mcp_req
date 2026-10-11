@@ -41,12 +41,43 @@ PACKAGE_NAME = "houdinimcp"
 
 
 def find_houdini_prefs(houdini_version=None):
-    """Find the Houdini user preferences directory."""
+    """Find the Houdini user preferences directory.
+
+    Mirrors Houdini's own resolution so the plugin installs where the running
+    Houdini actually reads from:
+      1. $HOUDINI_USER_PREF_DIR, if set, with its __HVER__ token replaced by
+         the version (Houdini's explicit override).
+      2. Else, if $HOME is set, Houdini uses $HOME/houdiniX.Y directly. This
+         matters on Windows: when launched from a shell (Git Bash exports
+         HOME=C:/Users/<u>) Houdini uses $HOME/houdiniX.Y, NOT the Documents
+         folder. Python's expanduser("~") returns USERPROFILE and ignores HOME,
+         so the old logic installed to Documents while Houdini ran from $HOME.
+      3. Else the platform default (Windows: ~/Documents, macOS:
+         ~/Library/Preferences/houdini, Linux: ~).
+    """
     system = platform.system()
+
+    # 1. Explicit override wins. Houdini requires the __HVER__ token in it and
+    #    substitutes the MAJOR.MINOR version at run time.
+    env_pref = os.environ.get("HOUDINI_USER_PREF_DIR")
+    if env_pref:
+        if houdini_version:
+            return env_pref.replace("__HVER__", houdini_version)
+        matches = sorted(glob.glob(env_pref.replace("__HVER__", "[0-9]*.[0-9]*")), reverse=True)
+        return matches[0] if matches else None
+
     home = os.path.expanduser("~")
+    home_env = os.environ.get("HOME")
 
     if system == "Windows":
-        base = os.path.join(home, "Documents")
+        # Houdini can honor $HOME on Windows, but hython launched from a shell
+        # also leaves stray $HOME/houdiniX.Y dirs; prefer an existing Documents
+        # prefs dir and fall back to $HOME only when Documents has none.
+        documents = os.path.join(home, "Documents")
+        if home_env and not glob.glob(os.path.join(documents, "houdini[0-9]*.[0-9]*")):
+            base = home_env
+        else:
+            base = documents
     elif system == "Darwin":
         base = os.path.join(home, "Library", "Preferences", "houdini")
     else:  # Linux
@@ -185,7 +216,7 @@ def install(prefs_dir, source_dir, dry_run=False):
         print(f"  {json.dumps(package_json, indent=2)}")
     else:
         os.makedirs(packages_dir, exist_ok=True)
-        with open(package_file, "w") as f:
+        with open(package_file, "w", encoding="utf-8") as f:
             json.dump(package_json, f, indent=2)
         print(f"\n  Created package file: {package_file}")
 
@@ -202,32 +233,38 @@ def install(prefs_dir, source_dir, dry_run=False):
     if dry_run:
         print(f"  WRITE {mcp_config_path}")
     else:
-        with open(mcp_config_path, "w") as f:
+        with open(mcp_config_path, "w", encoding="utf-8") as f:
             json.dump(mcp_config, f, indent=2)
             f.write("\n")
         print(f"  Created MCP config: {mcp_config_path}")
 
-    # Create/update pythonrc.py so Houdini auto-imports the plugin at startup
+    # Make Houdini auto-import the plugin at startup, from several hooks so a
+    # broken co-plugin cannot suppress it. pythonrc.py runs early, during app
+    # init, so an unhandled exception from another DSO (e.g. a version-mismatched
+    # render engine) aborts that phase and pythonrc never runs. 123.py (empty
+    # launch) and 456.py (scene load) run post-init and survive. Importing from
+    # all three is safe: start_server() is idempotent (guards on hou.session).
     scripts_dir = os.path.join(prefs_dir, "scripts")
-    pythonrc_path = os.path.join(scripts_dir, "pythonrc.py")
     import_line = "import houdinimcp  # Auto-start HoudiniMCP server"
 
-    existing_content = ""
-    if os.path.isfile(pythonrc_path):
-        with open(pythonrc_path) as f:
-            existing_content = f.read()
+    for hook_name in ("pythonrc.py", "123.py", "456.py"):
+        hook_path = os.path.join(scripts_dir, hook_name)
+        existing_content = ""
+        if os.path.isfile(hook_path):
+            with open(hook_path, encoding="utf-8") as f:
+                existing_content = f.read()
 
-    if "import houdinimcp" in existing_content:
-        print(f"  pythonrc.py already imports houdinimcp")
-    elif dry_run:
-        print(f"  APPEND '{import_line}' to {pythonrc_path}")
-    else:
-        os.makedirs(scripts_dir, exist_ok=True)
-        with open(pythonrc_path, "a") as f:
-            if existing_content and not existing_content.endswith("\n"):
-                f.write("\n")
-            f.write(import_line + "\n")
-        print(f"  Added auto-start to {pythonrc_path}")
+        if "import houdinimcp" in existing_content:
+            print(f"  {hook_name} already imports houdinimcp")
+        elif dry_run:
+            print(f"  APPEND '{import_line}' to {hook_path}")
+        else:
+            os.makedirs(scripts_dir, exist_ok=True)
+            with open(hook_path, "a", encoding="utf-8") as f:
+                if existing_content and not existing_content.endswith("\n"):
+                    f.write("\n")
+                f.write(import_line + "\n")
+            print(f"  Added auto-start to {hook_path}")
 
     print("\nDone!" if not dry_run else "\nDry run complete — no files were changed.")
     if not dry_run:
@@ -277,7 +314,7 @@ def configure_claude_code(dry_run=False):
     ]
 
     if os.path.isfile(settings_file):
-        with open(settings_file) as f:
+        with open(settings_file, encoding="utf-8") as f:
             settings = json.load(f)
     else:
         settings = {}
@@ -300,7 +337,7 @@ def configure_claude_code(dry_run=False):
         return
 
     os.makedirs(settings_dir, exist_ok=True)
-    with open(settings_file, "w") as f:
+    with open(settings_file, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
     for permission in added:

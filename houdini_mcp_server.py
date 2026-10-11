@@ -47,7 +47,16 @@ for p in [site_packages, win32_dir, win32_lib_dir, pythonwin_dir]:
 from mcp.server.fastmcp import FastMCP, Context
 import asyncio
 
-HOUDINI_PORT = int(os.getenv("HOUDINIMCP_PORT", 9876))
+# One GPU per machine caps useful instances, so the port range is a soft ceiling:
+# one instance per port. Both bounds are overridable for other hardware.
+MIN_PORT = int(os.getenv("HOUDINIMCP_BASE_PORT", 9876))
+MAX_PORT = MIN_PORT + int(os.getenv("HOUDINIMCP_MAX_INSTANCES", 8)) - 1
+HOUDINI_PORT = int(os.getenv("HOUDINIMCP_PORT", MIN_PORT))
+if not MIN_PORT <= HOUDINI_PORT <= MAX_PORT:
+    raise ValueError(
+        f"HOUDINIMCP_PORT {HOUDINI_PORT} out of range {MIN_PORT}-{MAX_PORT} "
+        "(raise HOUDINIMCP_MAX_INSTANCES to allow more)."
+    )
 HEADLESS_DISABLED = os.getenv("HOUDINIMCP_NO_HEADLESS", "").strip() in ("1", "true", "yes")
 
 logging.basicConfig(level=logging.INFO)
@@ -323,7 +332,18 @@ def get_houdini_connection() -> HoudiniConnection:
 
 # Now define the MCP server that Claude will talk to over stdio
 mcp = FastMCP("HoudiniMCP", instructions="""\
-IMPORTANT — Houdini MCP Connection Rules:
+IMPORTANT — Houdini MCP — Authoring & Connection Rules:
+
+0. **Build nodes, not code.** The deliverable is a node network a TD can open and edit —
+   not procedural code that does the work. The Python you send is scaffolding to build the
+   graph; the graph's logic lives in nodes. Motion/behavior comes from real solver/force
+   nodes (POP Force, POP Wind, DOP/SOP solvers), NOT from `@v += ...` in a wrangle; wrangles
+   are for attributes and selection. Don't add a control null of promoted parameters unless
+   the user asks. Honest exceptions (creating attributes, grouping, genuinely kinematic looks
+   with no force-node equivalent, real math) stay in a wrangle — say so. Full philosophy plus
+   the LLM pitfall checklist (A–H: don't guess node/parm names, verify silent no-ops, VEX
+   prefixes, sim discipline, respect the co-edited scene, async renders, trace attrs to the
+   render, build incrementally) is in BEST_PRACTICES.md — read it before non-trivial work.
 
 1. **Never rapid-fire commands.** Wait at least 1 second between consecutive tool calls.
    The Houdini plugin uses a single-threaded listener and needs time to reset between connections.
@@ -335,12 +355,28 @@ IMPORTANT — Houdini MCP Connection Rules:
 3. **Render commands are slow.** Rendering takes significantly longer than node operations.
    Do not assume a render has failed just because it takes time.
 
+3a. **A render may return `status: gpu_busy`.** The machine has one GPU shared by every
+   Houdini instance, and another instance is rendering. This is not a failure — wait a few
+   seconds and retry the same render.
+
 4. **If you get a connection error, STOP.** Do not retry in a loop — you likely crashed
    the plugin. Tell the user to restart the Houdini MCP plugin and verify the port is
    listening before trying again.
 
 5. **Verify connectivity first.** Use the `ping` tool before starting work to confirm
-   the Houdini plugin is reachable. If ping fails, tell the user immediately.
+   the Houdini plugin is reachable.
+
+5a. **You can open the Houdini GUI yourself — when the user asks for it.** This server
+   only ever auto-launches *headless* hython; it never starts the GUI. But GUI-only work
+   (viewport, screenshots, flipbooks, and GPU-only paths such as Copernicus/COPs) needs a
+   real GUI session. When the user asks you to open Houdini — or asks for GUI-only work
+   that has no live GUI session — launch it yourself from the shell instead of asking the
+   user to do it: run the `houdini` (or `houdinifx`) binary from the newest install
+   (`$HFS/bin`, else the highest `/opt/hfsNN.N.NNN/bin`), optionally with a `.hip` path,
+   in the background; a display must be present (`$DISPLAY`). The GUI's `pythonrc.py`
+   autostart binds the plugin on port 9876 — poll `ss -ltn | grep :9876` (startup takes
+   ~20–40s), then `ping`. Do NOT open the GUI on your own initiative to tidy up or
+   "get ready" — only when the user asks for it or for work that requires it.
 
 6. **Render workflow:** Render tools save images to disk (in /tmp/ by default) and return
    the file path. Use the Read tool to view the rendered image directly, or tell the user
@@ -354,12 +390,13 @@ IMPORTANT — Houdini MCP Connection Rules:
    `monitor_render` to poll for `husk` / `mantra-bin` processes and check if
    the output file exists. No Houdini connection needed.
 
-9. **Document non-trivial discoveries.** If you encounter a silent failure,
-   undocumented API quirk, or required workaround while using this MCP, read
-   `BEST_PRACTICES.md` in the houdini-mcp repo root first to check it isn't
-   already covered, then add a brief entry under the appropriate context
-   section (COPs, SOPs, LOPs, etc.) and update the index. Keep entries short:
-   problem, symptom, fix. No essays.
+9. **Document non-trivial discoveries (two layers).** Read `BEST_PRACTICES.md`
+   (repo root) first — it holds the philosophy, the A–H pitfalls, and a routing table.
+   A short, generalizable, first-pass rule (roughly <=100-200 tokens) goes there; an
+   involved or context-specific gotcha goes strictly in `best_practices/<area>.md`
+   (dops, cops, cop2, sops, lops_usd, rops_render, karma, mcp_and_environment, hda,
+   pdg, chops; create the file if missing). Always include the Houdini version. Keep
+   it to problem, symptom, fix — no essays.
 """)
 
 @asynccontextmanager
@@ -1625,22 +1662,25 @@ def subscribe_houdini_events(ctx: Context, types: List[str] = None) -> str:
 
 
 @mcp.tool()
-def search_docs(ctx: Context, query: str, top_k: int = 5) -> str:
-    """Search Houdini documentation offline using BM25.
+def search_docs(ctx: Context, query: str, top_k: int = 5, source: str = "houdini") -> str:
+    """Search documentation offline using BM25.
+    source: "houdini" (Houdini docs + hip patterns), "redshift" (Redshift for
+    Houdini manual) or "arnold" (Arnold core + HtoA user guides). Each source
+    has its own index.
     Returns ranked results with path, title, preview, and relevance score.
     Does NOT require a Houdini connection."""
     from houdini_rag import search_docs as _search
-    results = _search(query, top_k)
+    results = _search(query, top_k, source)
     if isinstance(results, dict) and "error" in results:
         return f"Error: {results['error']}"
     return json.dumps(results, indent=2)
 
 @mcp.tool()
-def get_doc(ctx: Context, path: str) -> str:
-    """Get the full content of a Houdini documentation page by its relative path
-    (as returned by search_docs). Does NOT require a Houdini connection."""
+def get_doc(ctx: Context, path: str, source: str = "houdini") -> str:
+    """Get the full content of a documentation page by its relative path and
+    source (as returned by search_docs). Does NOT require a Houdini connection."""
     from houdini_rag import get_doc_content
-    result = get_doc_content(path)
+    result = get_doc_content(path, source)
     if "error" in result:
         return f"Error: {result['error']}"
     return json.dumps(result, indent=2)

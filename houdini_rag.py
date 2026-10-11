@@ -20,6 +20,21 @@ INDEX_PATH = Path(os.environ.get("HOUDINIMCP_DOCS_INDEX", SCRIPT_DIR / "houdini_
 PATTERNS_DIR = Path(os.environ.get("HOUDINIMCP_PATTERNS_DIR", SCRIPT_DIR / "hip_patterns"))
 PATTERNS_INDEX_PATH = Path(os.environ.get("HOUDINIMCP_PATTERNS_INDEX", SCRIPT_DIR / "hip_patterns_index.json"))
 
+# Renderer manuals, each with its own index: name -> (docs dir, index path, fetch script)
+RENDERER_DOCS = {
+    "redshift": (
+        Path(os.environ.get("HOUDINIMCP_REDSHIFT_DOCS_DIR", SCRIPT_DIR / "redshift_docs")),
+        Path(os.environ.get("HOUDINIMCP_REDSHIFT_INDEX", SCRIPT_DIR / "redshift_docs_index.json")),
+        "scripts/fetch_redshift_docs.py",
+    ),
+    "arnold": (
+        Path(os.environ.get("HOUDINIMCP_ARNOLD_DOCS_DIR", SCRIPT_DIR / "arnold_docs")),
+        Path(os.environ.get("HOUDINIMCP_ARNOLD_INDEX", SCRIPT_DIR / "arnold_docs_index.json")),
+        "scripts/fetch_arnold_docs.py",
+    ),
+}
+DOC_SOURCES = ("houdini", *RENDERER_DOCS)
+
 
 class HoudiniTokenizer:
     """Tokenizer optimized for Houdini documentation.
@@ -227,9 +242,9 @@ class DocumentLoader:
                     content = f.read()
                 title = self.extract_title(content, filepath)
                 cleaned = self.clean_content(content)
-                rel_path = filepath.relative_to(self.docs_dir)
+                rel_path = filepath.relative_to(self.docs_dir).as_posix()
                 documents.append({
-                    'path': str(rel_path),
+                    'path': rel_path,
                     'title': title,
                     'content': cleaned,
                 })
@@ -327,17 +342,38 @@ def get_index():
     return _index
 
 
-def search_docs(query, top_k=5):
-    """Search Houdini documentation. Returns list of {path, title, preview, score}."""
-    index = get_index()
+_renderer_indexes = {}
+
+def get_renderer_index(renderer):
+    """Get or load the index of one renderer manual, building it if only the docs exist."""
+    if renderer not in _renderer_indexes:
+        docs_dir, index_path, _script = RENDERER_DOCS[renderer]
+        index = BM25Index.load(index_path)
+        if index is None and docs_dir.exists():
+            index = build_index(docs_dir, index_path)
+        _renderer_indexes[renderer] = index
+    return _renderer_indexes[renderer]
+
+
+def search_docs(query, top_k=5, source="houdini"):
+    """Search one documentation source. Returns list of {path, title, preview, score}."""
+    if source not in DOC_SOURCES:
+        return {"error": f"Unknown docs source {source!r}. Valid: {', '.join(DOC_SOURCES)}"}
+    if source == "houdini":
+        index, script = get_index(), "scripts/fetch_houdini_docs.py"
+    else:
+        index, script = get_renderer_index(source), RENDERER_DOCS[source][2]
     if index is None:
-        return {"error": "Docs index not available. Run: python scripts/fetch_houdini_docs.py"}
+        return {"error": f"{source} docs index not available. Run: python {script}"}
     return index.search(query, top_k)
 
 
-def get_doc_content(doc_path):
+def get_doc_content(doc_path, source="houdini"):
     """Get full content of a specific document by relative path."""
-    full_path = DOCS_DIR / doc_path
+    if source not in DOC_SOURCES:
+        return {"error": f"Unknown docs source {source!r}. Valid: {', '.join(DOC_SOURCES)}"}
+    docs_dir = DOCS_DIR if source == "houdini" else RENDERER_DOCS[source][0]
+    full_path = docs_dir / doc_path
     if not full_path.exists():
         return {"error": f"Document not found: {doc_path}"}
     with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:

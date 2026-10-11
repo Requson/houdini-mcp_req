@@ -152,9 +152,9 @@ class TestDocumentLoader:
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create a couple of test docs
             os.makedirs(os.path.join(tmpdir, "sop"))
-            with open(os.path.join(tmpdir, "sop", "box.md"), "w") as f:
+            with open(os.path.join(tmpdir, "sop", "box.md"), "w", encoding="utf-8") as f:
                 f.write("= Box SOP =\nCreates a box.")
-            with open(os.path.join(tmpdir, "sop", "sphere.md"), "w") as f:
+            with open(os.path.join(tmpdir, "sop", "sphere.md"), "w", encoding="utf-8") as f:
                 f.write("# Sphere SOP\nCreates a sphere.")
 
             loader = DocumentLoader(tmpdir)
@@ -172,9 +172,9 @@ class TestBuildIndex:
     def test_build_from_temp_docs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             os.makedirs(os.path.join(tmpdir, "sop"))
-            with open(os.path.join(tmpdir, "sop", "box.md"), "w") as f:
+            with open(os.path.join(tmpdir, "sop", "box.md"), "w", encoding="utf-8") as f:
                 f.write("= Box SOP =\nCreates a box primitive.")
-            with open(os.path.join(tmpdir, "sop", "sphere.md"), "w") as f:
+            with open(os.path.join(tmpdir, "sop", "sphere.md"), "w", encoding="utf-8") as f:
                 f.write("= Sphere SOP =\nCreates a sphere primitive.")
 
             idx_path = os.path.join(tmpdir, "index.json")
@@ -212,7 +212,7 @@ class TestSearchAndGetDoc:
     def test_get_doc_content_exists(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             os.makedirs(os.path.join(tmpdir, "sop"))
-            with open(os.path.join(tmpdir, "sop", "box.md"), "w") as f:
+            with open(os.path.join(tmpdir, "sop", "box.md"), "w", encoding="utf-8") as f:
                 f.write("= Box SOP =\nCreates a box.")
 
             import houdini_rag
@@ -227,14 +227,54 @@ class TestSearchAndGetDoc:
 
 
 # ---------------------------------------------------------------------------
+# Renderer manual sources (separate indexes)
+# ---------------------------------------------------------------------------
+class TestRendererSources:
+    def _use_temp_redshift(self, monkeypatch, tmp_path):
+        import houdini_rag
+        docs = tmp_path / "redshift_docs"
+        docs.mkdir()
+        (docs / "AOVs.md").write_text("# AOVs\nMulti-layer EXR output for AOVs.", encoding="utf-8")
+        monkeypatch.setattr(houdini_rag, "RENDERER_DOCS", {
+            "redshift": (docs, tmp_path / "rs_index.json", "scripts/fetch_redshift_docs.py"),
+        })
+        monkeypatch.setattr(houdini_rag, "_renderer_indexes", {})
+        return tmp_path
+
+    def test_unknown_source(self):
+        assert "error" in search_docs("aov", source="nope")
+        assert "error" in get_doc_content("x.md", source="nope")
+
+    def test_search_builds_separate_index(self, monkeypatch, tmp_path):
+        self._use_temp_redshift(monkeypatch, tmp_path)
+        results = search_docs("multi-layer exr", source="redshift")
+        assert results[0]["path"] == "AOVs.md"
+        assert (tmp_path / "rs_index.json").exists()
+
+    def test_missing_renderer_docs_names_fetch_script(self, monkeypatch, tmp_path):
+        import houdini_rag
+        monkeypatch.setattr(houdini_rag, "RENDERER_DOCS", {
+            "redshift": (tmp_path / "none", tmp_path / "none.json", "scripts/fetch_redshift_docs.py"),
+        })
+        monkeypatch.setattr(houdini_rag, "_renderer_indexes", {})
+        result = search_docs("aov", source="redshift")
+        assert "fetch_redshift_docs.py" in result["error"]
+
+    def test_get_doc_from_renderer_source(self, monkeypatch, tmp_path):
+        self._use_temp_redshift(monkeypatch, tmp_path)
+        result = get_doc_content("AOVs.md", source="redshift")
+        assert "Multi-layer EXR" in result["content"]
+
+
+# ---------------------------------------------------------------------------
 # PatternLoader
 # ---------------------------------------------------------------------------
 class TestPatternLoader:
     def test_load_all_from_temp_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with open(os.path.join(tmpdir, "scene_abc123.txt"), "w") as f:
+            with open(os.path.join(tmpdir, "scene_abc123.txt"), "w", encoding="utf-8") as f:
                 f.write("Pattern: Scene Graph\nSource: test.hip\n\nNodes:\n  box1 (SOP) [box]")
-            with open(os.path.join(tmpdir, "recipe_def456.txt"), "w") as f:
+            with open(os.path.join(tmpdir, "recipe_def456.txt"), "w", encoding="utf-8") as f:
                 f.write("Pattern: box Recipe\nSource: test.hip\n\nNodes:\n  box1 (SOP) [box] — size: 2")
 
             loader = PatternLoader(tmpdir)
@@ -246,7 +286,7 @@ class TestPatternLoader:
 
     def test_title_from_first_line(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with open(os.path.join(tmpdir, "recipe_abc.txt"), "w") as f:
+            with open(os.path.join(tmpdir, "recipe_abc.txt"), "w", encoding="utf-8") as f:
                 f.write("Pattern: box Recipe\nSource: test.hip")
 
             loader = PatternLoader(tmpdir)
@@ -274,9 +314,9 @@ class TestBuildCombinedIndex:
             os.makedirs(os.path.join(docs_dir, "sop"))
             os.makedirs(patterns_dir)
 
-            with open(os.path.join(docs_dir, "sop", "box.md"), "w") as f:
+            with open(os.path.join(docs_dir, "sop", "box.md"), "w", encoding="utf-8") as f:
                 f.write("= Box SOP =\nCreates a box primitive.")
-            with open(os.path.join(patterns_dir, "recipe_abc.txt"), "w") as f:
+            with open(os.path.join(patterns_dir, "recipe_abc.txt"), "w", encoding="utf-8") as f:
                 f.write("Pattern: box Recipe\nSource: test.hip\nCategory: SOP\n\nNodes:\n  box1 (SOP) [box] — size: 2")
 
             idx_path = os.path.join(tmpdir, "combined.json")
@@ -294,7 +334,7 @@ class TestBuildCombinedIndex:
         with tempfile.TemporaryDirectory() as tmpdir:
             patterns_dir = os.path.join(tmpdir, "patterns")
             os.makedirs(patterns_dir)
-            with open(os.path.join(patterns_dir, "scene_abc.txt"), "w") as f:
+            with open(os.path.join(patterns_dir, "scene_abc.txt"), "w", encoding="utf-8") as f:
                 f.write("Pattern: Scene Graph\nSource: test.hip")
 
             idx_path = os.path.join(tmpdir, "combined.json")
@@ -309,7 +349,7 @@ class TestBuildCombinedIndex:
         with tempfile.TemporaryDirectory() as tmpdir:
             patterns_dir = os.path.join(tmpdir, "patterns")
             os.makedirs(patterns_dir)
-            with open(os.path.join(patterns_dir, "recipe_abc.txt"), "w") as f:
+            with open(os.path.join(patterns_dir, "recipe_abc.txt"), "w", encoding="utf-8") as f:
                 f.write("Pattern: box Recipe\nSource: test.hip\nCategory: SOP\n\nNodes:\n  box1 (SOP) [box] — size: 2")
 
             idx_path = os.path.join(tmpdir, "combined.json")
